@@ -2,7 +2,350 @@
 
 Dynamic, self-expanding knowledge graph from **war reporting** with **zero hardcoded taxonomies**.
 
-> **Current Demo Dataset:** Iran-Israel War of 2026 (Feb 28 – present) — 38 articles covering military operations, sanctions, diplomacy, cyber warfare, humanitarian crisis, and oil market impacts. The system itself is **not hardcoded to Iran** — it will work on any war dataset you provide.
+Based on your uploaded News Intelligence Knowledge Graph architecture specification, here is a complete end-to-end project data flow showing where every technology is used. 
+
+# High-Level Architecture
+
+```text
+                         ┌──────────────────────┐
+                         │ Raw News Articles    │
+                         │ JSON / JSONL         │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                     ┌──────────────────────────┐
+                     │ Stage 1: Ingestion       │
+                     │ ArticleLoader            │
+                     └──────────┬───────────────┘
+                                │
+                                │ Store Metadata
+                                ▼
+                      ┌─────────────────────┐
+                      │ SQLite Database     │
+                      │ SQLAlchemy ORM      │
+                      └─────────┬───────────┘
+                                │
+                                ▼
+               ┌─────────────────────────────────┐
+               │ Stage 2: Entity Extraction      │
+               │ GLiNER / spaCy                  │
+               └──────────────┬──────────────────┘
+                              │
+                              ▼
+                    Entity Mentions
+                              │
+                              ▼
+          ┌──────────────────────────────────────┐
+          │ Stage 3: Entity Resolution           │
+          │ RapidFuzz + Embeddings + ChromaDB    │
+          └──────────────┬───────────────────────┘
+                         │
+                         ▼
+              Canonical Entities Created
+                         │
+                         ├────────────► SQLite
+                         │
+                         └────────────► ChromaDB
+
+```
+
+---
+
+# Full Pipeline Flow
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│                     NEWS ARTICLES                          │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+
+┌────────────────────────────────────────────────────────────┐
+│ Stage 1 : INGESTION                                        │
+│ Technology:                                                 │
+│ • Python                                                   │
+│ • Pydantic                                                 │
+│ • SQLAlchemy                                               │
+│ • SQLite                                                   │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+
+┌────────────────────────────────────────────────────────────┐
+│ Stage 2 : ENTITY EXTRACTION                                │
+│ Technology:                                                 │
+│ • GLiNER                                                   │
+│ • spaCy (Fallback)                                         │
+│ • Dynamic Ontology Labels                                 │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+
+                Entity Mentions
+                           │
+                           ▼
+
+┌────────────────────────────────────────────────────────────┐
+│ Stage 3 : ENTITY RESOLUTION                                │
+│ Technology:                                                 │
+│ • RapidFuzz                                                │
+│ • BGE Embeddings                                           │
+│ • ChromaDB Entity Collection                              │
+│ • SQLite Alias Store                                      │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+
+                Canonical Entities
+                           │
+                           ▼
+
+┌────────────────────────────────────────────────────────────┐
+│ Stage 4 : EMBEDDING GENERATION                             │
+│ Technology:                                                 │
+│ • Sentence Transformers                                    │
+│ • BAAI/bge-small-en-v1.5                                   │
+│ • Torch                                                    │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+
+                   Article Vectors
+                           │
+                           ▼
+
+┌────────────────────────────────────────────────────────────┐
+│ Stage 5 : VECTOR STORAGE                                   │
+│ Technology:                                                 │
+│ • ChromaDB                                                 │
+│                                                           │
+│ Collections:                                               │
+│ 1. news_articles                                           │
+│ 2. canonical_entities                                      │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+
+┌────────────────────────────────────────────────────────────┐
+│ Stage 6 : DUPLICATE DETECTION                              │
+│ Technology:                                                 │
+│ • Cosine Similarity                                        │
+│ • Scikit-Learn                                             │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+
+              Unique Articles Only
+                           │
+                           ▼
+
+┌────────────────────────────────────────────────────────────┐
+│ Stage 7 : EVENT CLUSTERING                                 │
+│ Technology:                                                 │
+│ • HDBSCAN                                                  │
+│ • Temporal Windowing                                       │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+
+                    Event Clusters
+                           │
+                           ▼
+
+┌────────────────────────────────────────────────────────────┐
+│ Stage 8 : EVENT BUILDER                                    │
+│ Technology:                                                 │
+│ • Python                                                   │
+│ • Deterministic Logic                                      │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+
+                 Event Context
+                           │
+                           ▼
+
+┌────────────────────────────────────────────────────────────┐
+│ Stage 9 : RELATION EXTRACTION                              │
+│ Technology:                                                 │
+│ • Claude Haiku                                             │
+│ OR                                                        │
+│ • GPT-4o-mini                                              │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+
+            Free-form Relation Triples
+                           │
+                           ▼
+
+┌────────────────────────────────────────────────────────────┐
+│ Stage 9B : RELATION ONTOLOGY                               │
+│ Technology:                                                 │
+│ • ChromaDB                                                 │
+│ • BGE Embeddings                                           │
+│ • HDBSCAN                                                  │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+
+           Canonical Relations
+                           │
+                           ▼
+
+┌────────────────────────────────────────────────────────────┐
+│ Stage 9C : ENTITY TYPE INDUCTION                           │
+│ Technology:                                                 │
+│ • LLM Suggestions                                          │
+│ • ChromaDB                                                 │
+│ • Embedding Similarity                                     │
+│ • SQLite Ontology                                          │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+
+           Dynamic Ontology Updated
+                           │
+                           ▼
+
+┌────────────────────────────────────────────────────────────┐
+│ Stage 10 : GRAPH BUILDING                                  │
+│ Technology:                                                 │
+│ • NetworkX                                                 │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+
+            Knowledge Graph
+                           │
+                           ▼
+
+┌────────────────────────────────────────────────────────────┐
+│ Stage 11 : GRAPH ANALYTICS                                 │
+│ Technology:                                                 │
+│ • NetworkX                                                 │
+│ • Centrality Metrics                                       │
+│ • Co-occurrence Analysis                                   │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+
+┌────────────────────────────────────────────────────────────┐
+│ Stage 12 : EXPORT                                           │
+│ Technology:                                                 │
+│ • PyVis                                                    │
+│ • CSV Export                                               │
+│ • JSON Export                                              │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+
+             graph.html
+             nodes.csv
+             relationships.csv
+             analytics_report.json
+             ontology_report.json
+```
+
+---
+
+# Storage Architecture
+
+```text
+                   ┌──────────────┐
+                   │ SQLite       │
+                   └──────┬───────┘
+                          │
+      ┌───────────────────┼─────────────────────┐
+      │                   │                     │
+      ▼                   ▼                     ▼
+
+ Articles Table   Entity Ontology     Relation Ontology
+
+      │
+      ▼
+
+ Canonical Entities
+
+      │
+      ▼
+
+ Alias Learning Table
+```
+
+---
+
+# Vector Architecture
+
+```text
+                 ┌─────────────────┐
+                 │ Embeddings      │
+                 │ BGE Model       │
+                 └────────┬────────┘
+                          │
+          ┌───────────────┴──────────────┐
+          │                              │
+          ▼                              ▼
+
+  Article Embeddings             Entity Embeddings
+
+          │                              │
+          ▼                              ▼
+
+   Chroma Collection            Chroma Collection
+
+    news_articles              canonical_entities
+```
+
+---
+
+# Knowledge Graph Structure
+
+```text
+                ┌─────────────┐
+                │   Event     │
+                └──────┬──────┘
+                       │
+          PARTICIPATES_IN
+                       │
+     ┌─────────────────┼─────────────────┐
+     │                 │                 │
+     ▼                 ▼                 ▼
+
+ Entity A         Entity B         Entity C
+
+     │                 │
+     │ ATTACKS         │ SANCTIONS
+     │                 │
+     ▼                 ▼
+
+ Entity D         Entity E
+```
+
+---
+
+# Tech Stack by Responsibility
+
+| Responsibility      | Technology                 |
+| ------------------- | -------------------------- |
+| News Input          | JSON / JSONL               |
+| Validation          | Pydantic                   |
+| Database            | SQLite + SQLAlchemy        |
+| Entity Extraction   | GLiNER                     |
+| Fallback NER        | spaCy                      |
+| Embeddings          | BGE Small / Large          |
+| Vector DB           | ChromaDB                   |
+| Entity Matching     | RapidFuzz                  |
+| Deduplication       | Scikit-Learn               |
+| Event Clustering    | HDBSCAN                    |
+| Relation Extraction | Claude Haiku / GPT-4o-mini |
+| Ontology Learning   | ChromaDB + Embeddings      |
+| Graph Construction  | NetworkX                   |
+| Visualization       | PyVis                      |
+| Reporting           | JSON                       |
+| Export              | CSV                        |
+
+One architectural concern: your design claims "no hardcoded ontology", but GLiNER still requires labels to extract entities. Starting from a completely empty ontology will produce weak extraction quality. In practice, a minimal seed ontology (Person, Organization, Location, Event) is almost mandatory; otherwise the bootstrap phase becomes unreliable. This is the main weakness in the current architecture.
 
 ## Quick Start
 
