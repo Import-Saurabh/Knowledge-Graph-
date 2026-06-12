@@ -1,0 +1,39 @@
+# This file is OPTIONAL. If absent, system starts from empty ontology
+# and learns everything from data. If present, it seeds initial types.
+entity_types:
+  - name: Person
+    parent: null
+  - name: Organization
+    parent: null
+  - name: Location
+    parent: null
+  - name: Country
+    parent: Location
+  - name: City
+    parent: Location
+  - name: Event
+    parent: null
+  - name: Stock market
+  - name : brent crude oil index
+  - name : gold index
+  - name : us treasury bond index
+  - name : usd index
+  - name : eur index
+  - name : chokepoints
+  - name : commodities
+  - name : economic indicators
+  - name : geopolitical risks
+  - name : oil production
+  - name : natural gas production
+  - name : oil reefineries
+  - name : asian markets
+  - name : european markets
+  - name : american markets
+  - name : trade routes
+  - name : sanctions
+  - name : supply chain disruptions
+  - name : inflation rates
+  - name : interest rates
+  - name : currency exchange rates 
+  
+relation_types: []  # Relations are fully discovered from LLM output

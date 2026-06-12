@@ -1,0 +1,42 @@
+# Core
+pydantic>=2.0
+pydantic-settings>=2.0
+python-dotenv>=1.0
+structlog>=24.0
+pyyaml>=6.0
+
+# Storage
+sqlalchemy>=2.0
+chromadb>=0.5
+
+# NLP / NER
+gliner>=0.2
+spacy>=3.7
+rapidfuzz>=3.0
+
+# Embeddings
+sentence-transformers>=3.0
+torch>=2.0
+
+# Clustering
+hdbscan>=0.8
+scikit-learn>=1.4
+numpy>=1.26
+
+# Graph
+networkx>=3.0
+pyvis>=0.3
+
+# LLM clients (pick the one you use)
+anthropic>=0.30
+openai>=1.40
+groq>=0.9
+
+# News Download
+gnews>=0.3.5
+newspaper4k>=0.9.3
+lxml_html_clean>=0.1.0
+
+# Testing
+pytest>=8.0
+pytest-cov>=5.0
