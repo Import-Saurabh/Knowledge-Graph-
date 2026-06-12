@@ -1,0 +1,133 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# =========================
+# Environment Variables
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# IDEs
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# OS Files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Logs
+# =========================
+logs/
+*.log
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Build / Distribution
+# =========================
+build/
+dist/
+*.egg-info/
+
+# =========================
+# Databases
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+
+# =========================
+# ChromaDB
+# =========================
+chroma/
+chroma_db/
+persist/
+vector_db/
+
+# =========================
+# ML Models
+# =========================
+models/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.onnx
+*.pkl
+*.joblib
+
+# =========================
+# Downloaded News Data
+# =========================
+data/raw/
+data/cache/
+downloads/
+
+# =========================
+# Generated Outputs
+# =========================
+output/
+outputs/
+results/
+reports/
+kg_output/
+graphify-out/
+exports/
+
+# =========================
+# Graph Files
+# =========================
+*.gexf
+*.graphml
+*.gpickle
+
+# =========================
+# Temporary Files
+# =========================
+tmp/
+temp/
+.cache/
+
+# =========================
+# Testing
+# =========================
+.pytest_cache/
+.coverage
+htmlcov/
+
+# =========================
+# Node (if frontend exists)
+# =========================
+node_modules/
+
+# =========================
+# Secrets
+# =========================
+secrets/
+credentials.json
+service_account.json
