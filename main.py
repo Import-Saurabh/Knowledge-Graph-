@@ -2,7 +2,9 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime
+import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
 
 # Add src to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -23,11 +25,28 @@ from src.graph.graph_builder import GraphBuilder
 from src.graph.neo4j_exporter import Neo4jExporter
 from src.analytics.graph_metrics import GraphMetrics
 from src.utils.logger import get_logger
-from src.utils.db import init_db
+from src.utils.db import init_db, get_session, ArticleDB
 from src.utils.config import settings
 from src.models.relation import LLMRelationResponse
 
 log = get_logger(__name__)
+
+
+@contextmanager
+def managed_session():
+    """
+    Context manager that yields a DB session and guarantees
+    rollback on exception and proper close().
+    """
+    session = get_session()
+    try:
+        yield session
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
 
 def run_pipeline(args):
     os.makedirs("data/exports", exist_ok=True)
@@ -90,9 +109,12 @@ def run_pipeline(args):
         except Exception as e:
             log.error("extraction_batch_failed", error=str(e))
             for article in batch:
-                mentions = extractor.extract_single(article)
-                article_to_mentions[article.id] = mentions
-                all_mentions.extend(mentions)
+                try:
+                    mentions = extractor.extract_single(article)
+                    article_to_mentions[article.id] = mentions
+                    all_mentions.extend(mentions)
+                except Exception as inner_e:
+                    log.error("extraction_single_failed", article_id=article.id, error=str(inner_e))
 
     log.info("ner_complete", mentions=len(all_mentions))
 
@@ -129,7 +151,10 @@ def run_pipeline(args):
     loader.update_status([a.id for a in non_dup_articles], "deduplicated")
 
     # Stage 7: Clustering
-    clusterer = EventClusterer()
+    # Pass the shared embedder so EventClusterer does NOT reload the BGE model
+    # from disk for every temporal window.  Without this, each window pays a
+    # 5-10s model-load penalty.
+    clusterer = EventClusterer(embedder=embedder)
     clusters = clusterer.run_all_windows(non_dup_articles)
 
     # Stage 8: Event Building
@@ -137,16 +162,18 @@ def run_pipeline(args):
     events = [builder.build_event(c) for c in clusters]
 
     # Update article cluster assignments
-    from src.utils.db import get_session, ArticleDB
-    session = get_session()
-    for event in events:
-        session.query(ArticleDB).filter(ArticleDB.id.in_(event.article_ids)).update({
-            ArticleDB.cluster_id: event.cluster_id,
-            ArticleDB.temporal_window: event.temporal_window,
-            ArticleDB.status: "clustered"
-        }, synchronize_session=False)
-    session.commit()
-    session.close()
+    try:
+        with managed_session() as session:
+            for event in events:
+                session.query(ArticleDB).filter(ArticleDB.id.in_(event.article_ids)).update({
+                    ArticleDB.cluster_id: event.cluster_id,
+                    ArticleDB.temporal_window: event.temporal_window,
+                    ArticleDB.status: "clustered"
+                }, synchronize_session=False)
+            session.commit()
+    except Exception as e:
+        log.error("cluster_assignment_failed", error=str(e))
+        raise
 
     log.info("events_built", count=len(events))
 
@@ -180,7 +207,6 @@ def run_pipeline(args):
                     discovered_entity_types=[]
                 ))
 
-            import time
             time.sleep(1)
     else:
         for event in events:
@@ -209,7 +235,7 @@ def run_pipeline(args):
     ontology_report = {
         "entity_types": ontology.get_ontology_report(),
         "relation_types": relation_ontology.get_relation_taxonomy() if not args.skip_llm else [],
-        "generated_at": datetime.utcnow().isoformat()
+        "generated_at": datetime.now(timezone.utc).isoformat()
     }
     with open("data/exports/ontology_report.json", "w", encoding="utf-8") as f:
         json.dump(ontology_report, f, indent=2, ensure_ascii=False)
@@ -227,7 +253,7 @@ if __name__ == "__main__":
     parser.add_argument("--fast", action="store_true", help="Use spaCy fallback for NER")
     parser.add_argument("--skip-llm", action="store_true", help="Skip LLM relation extraction")
     parser.add_argument("--daily", action="store_true", help="Daily mode: only process new articles")
-    
+
     # Download arguments
     parser.add_argument("--download", action="store_true",
                         help="Download articles from Google News via gnews")
@@ -246,7 +272,7 @@ if __name__ == "__main__":
                         help="Restrict GNews queries to specific MEDIA_HOUSES categories. "
                              "Choices: global_news finance_business energy_commodities "
                              "india china defense_security. Default: all categories.")
-    
+
     args = parser.parse_args()
 
     if args.run_all or args.daily:

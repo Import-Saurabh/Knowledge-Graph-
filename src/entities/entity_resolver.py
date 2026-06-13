@@ -77,7 +77,6 @@ class EntityResolver:
         )
 
     def _fuse_scores(self, fuzzy_candidates: List[dict], semantic_matches: dict) -> Optional[dict]:
-        # semantic_matches is chroma query result
         if not semantic_matches or not semantic_matches.get("ids"):
             return fuzzy_candidates[0] if fuzzy_candidates else None
 
@@ -88,17 +87,14 @@ class EntityResolver:
         best = None
         best_score = 0
 
-        # Check fuzzy candidates
         for cand in fuzzy_candidates:
             entity = self._get_entity_by_id(cand["canonical_id"])
             if not entity:
                 continue
             score = cand["score"]
-            # Find semantic score for same entity
             sem_score = 0
             for i, sid in enumerate(ids):
                 if sid == cand["canonical_id"]:
-                    # Chroma returns distances (lower is closer), convert to similarity
                     dist = distances[i] if i < len(distances) else 1.0
                     sem_score = 1.0 - min(dist, 1.0)
                     break
@@ -107,7 +103,6 @@ class EntityResolver:
                 best_score = fused
                 best = {"entity": entity, "score": fused}
 
-        # If no fuzzy match, check pure semantic
         if best is None and ids:
             for i, sid in enumerate(ids[:3]):
                 dist = distances[i] if i < len(distances) else 1.0
@@ -165,7 +160,6 @@ class EntityResolver:
         db.mention_count += 1
         db.last_seen = datetime.utcnow()
 
-        # Update aliases
         aliases = []
         try:
             aliases = json.loads(db.aliases) if db.aliases else []
@@ -175,7 +169,6 @@ class EntityResolver:
             aliases.append(mention.text)
             db.aliases = json.dumps(aliases)
 
-            # Add to alias table
             alias_db = EntityAliasDB(
                 alias_id=str(uuid.uuid4()),
                 alias_text=mention.text,
@@ -185,15 +178,14 @@ class EntityResolver:
             )
             session.add(alias_db)
 
-        # Update embedding (running average)
         if mention.entity_type != "Unknown" and db.type_id != mention.entity_type:
-            # Update type if more specific
             from src.utils.db import EntityOntologyDB
             type_db = session.query(EntityOntologyDB).filter_by(type_name=mention.entity_type).first()
             if type_db:
                 db.type_id = type_db.type_id
 
         if mention.entity_type != "Unknown":
+            from src.utils.db import EntityOntologyDB
             type_db = session.query(EntityOntologyDB).filter_by(type_name=mention.entity_type).first()
             if type_db:
                 type_db.mention_count += 1
@@ -202,7 +194,6 @@ class EntityResolver:
         session.commit()
         session.close()
 
-        # Update chroma
         if self.chroma and entity.embedding_vector:
             try:
                 self.chroma.update_entities(
@@ -226,9 +217,21 @@ class EntityResolver:
 
     def _create_entity(self, mention: EntityMention, normalized: str, mention_embedding: Optional[List[float]]) -> CanonicalEntity:
         session = get_session()
+        canonical_name = mention.text.strip()
+
+        # --- UPSERT GUARD ---
+        # Check for an existing entity with this canonical_name before inserting.
+        # Without this, every re-run raises `UNIQUE constraint failed:
+        # canonical_entities.canonical_name` for high-frequency entities like
+        # "Iran", "Israel", etc., causing all their resolutions to fail.
+        existing_db = session.query(CanonicalEntityDB).filter_by(canonical_name=canonical_name).first()
+        if existing_db:
+            session.close()
+            existing_entity = self._db_to_model(existing_db)
+            log.info("entity_exists_reusing", canonical_name=canonical_name)
+            return self._update_entity(existing_entity, mention, normalized)
 
         canonical_id = str(uuid.uuid4())
-        canonical_name = mention.text.strip()
 
         # Determine type
         type_id = None
@@ -278,10 +281,25 @@ class EntityResolver:
         )
         session.add(mention_db)
 
-        session.commit()
+        try:
+            session.commit()
+        except Exception as e:
+            # Last-ditch safety net: another thread/process may have inserted
+            # the same name between our SELECT and this INSERT.  Roll back and
+            # re-fetch rather than propagating the error.
+            session.rollback()
+            session.close()
+            log.warning("entity_create_race_retry", canonical_name=canonical_name, error=str(e))
+            session2 = get_session()
+            existing_db = session2.query(CanonicalEntityDB).filter_by(canonical_name=canonical_name).first()
+            session2.close()
+            if existing_db:
+                existing_entity = self._db_to_model(existing_db)
+                return self._update_entity(existing_entity, mention, normalized)
+            raise
+
         session.close()
 
-        # Add to ChromaDB
         if self.chroma and mention_embedding:
             try:
                 self.chroma.add_entities(

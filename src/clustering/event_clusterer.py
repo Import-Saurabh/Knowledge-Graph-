@@ -1,6 +1,6 @@
 import numpy as np
 import hdbscan
-from typing import List, Dict
+from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 from src.utils.logger import get_logger
 from src.utils.config import settings
@@ -9,19 +9,44 @@ from src.utils.db import get_session, ArticleDB
 log = get_logger(__name__)
 
 class EventClusterer:
-    def __init__(self):
+    """
+    Clusters articles into events using HDBSCAN over BGE embeddings.
+
+    IMPORTANT: Pass the shared `EmbeddingGenerator` instance from main.py via
+    the `embedder` constructor argument.  The original code created a new
+    EmbeddingGenerator() inside _cluster_window(), which reloaded the BGE
+    model from disk on every temporal window — typically 5-10 seconds of pure
+    model-load overhead per window, multiplied by however many windows exist.
+
+    If no embedder is supplied, one is lazily created and cached on first use
+    so the model is still only loaded once.
+    """
+
+    def __init__(self, embedder=None):
         self.window_days = settings.TEMPORAL_WINDOW_DAYS
         self.min_cluster_size = settings.MIN_CLUSTER_SIZE
+        # Shared embedder injected from the pipeline — avoids reloading the
+        # model for every temporal window.
+        self._embedder = embedder
+        self._local_embedder = None  # fallback, lazily initialised once
+
+    def _get_embedder(self):
+        """Return the shared embedder, or lazily create a local one."""
+        if self._embedder is not None:
+            return self._embedder
+        if self._local_embedder is None:
+            from src.embeddings.embedding_generator import EmbeddingGenerator
+            self._local_embedder = EmbeddingGenerator()
+            log.info("event_clusterer_local_embedder_created")
+        return self._local_embedder
 
     def run_all_windows(self, articles) -> List[dict]:
-        # Group articles by temporal window
         windows = self._group_by_window(articles)
         all_clusters = []
 
         for window, window_articles in windows.items():
             if len(window_articles) < self.min_cluster_size:
                 continue
-
             clusters = self._cluster_window(window_articles, window)
             all_clusters.extend(clusters)
 
@@ -42,8 +67,8 @@ class EventClusterer:
         return windows
 
     def _cluster_window(self, articles, window: str) -> List[dict]:
-        from src.embeddings.embedding_generator import EmbeddingGenerator
-        embedder = EmbeddingGenerator()
+        # Use the shared embedder — no model reload.
+        embedder = self._get_embedder()
 
         texts = [f"{a.title}. {a.content[:2000]}" for a in articles]
         embeddings = embedder.embed_texts(texts)
@@ -76,4 +101,5 @@ class EventClusterer:
                 "article_ids": [a.id for a in cluster_articles]
             })
 
+        log.info("window_clustered", window=window, articles=len(articles), clusters=len(result))
         return result
