@@ -469,4 +469,20 @@ pytest tests/ -v
 ```bash
 # Cron job at 23:59 every day
 python main.py --input data/raw/daily/ --run-all --daily
+First verify what your CLI supports:
+
+python main.py --help
+| Stage | Purpose             |
+| ----- | ------------------- |
+| 1     | Download news       |
+| 2     | Parse/Clean         |
+| 3     | Deduplicate         |
+| 4     | Entity extraction   |
+| 5     | Embeddings          |
+| 6     | Store embeddings    |
+| 7     | Event clustering    |
+| 8     | Event building      |
+| 9     | Relation extraction |
+| 10    | Graph generation    |
+
 ```
