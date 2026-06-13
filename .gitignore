@@ -84,9 +84,7 @@ checkpoints/
 # =========================
 # Downloaded News Data
 # =========================
-data/raw/
-data/cache/
-downloads/
+
 
 # =========================
 # Generated Outputs

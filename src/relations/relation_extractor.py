@@ -1,6 +1,8 @@
 import json
+import re
 import time
 from typing import List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.models.event import EventModel
 from src.models.relation import RelationTriple, LLMRelationResponse
 from src.utils.config import settings
@@ -43,7 +45,6 @@ Output ONLY valid JSON:
 }
 """
 
-# Provider defaults
 PROVIDER_DEFAULTS = {
     "anthropic": {"model": "claude-3-haiku-20240307", "client": "anthropic"},
     "openai": {"model": "gpt-4o-mini", "client": "openai"},
@@ -53,14 +54,33 @@ PROVIDER_DEFAULTS = {
 }
 
 class RelationExtractor:
-    def __init__(self, provider: str = None):
+    def __init__(self, provider: str = None, max_workers: int = 2):
         self.provider = (provider or settings.LLM_PROVIDER).lower().strip()
         self._client = None
         self._model = None
+        self.max_workers = max_workers
 
     def _get_config(self):
         defaults = PROVIDER_DEFAULTS.get(self.provider, PROVIDER_DEFAULTS["groq"])
-        model = settings.LLM_MODEL or defaults["model"]
+
+        configured = settings.LLM_MODEL
+        if configured:
+            is_namespaced = "/" in configured
+            provider_needs_plain = self.provider in ("groq", "openai", "anthropic", "moonshot")
+            if provider_needs_plain and is_namespaced:
+                log.warning(
+                    "model_provider_mismatch",
+                    configured_model=configured,
+                    provider=self.provider,
+                    fallback_model=defaults["model"],
+                    hint="Set LLM_MODEL to a plain slug for this provider, or leave it blank."
+                )
+                model = defaults["model"]
+            else:
+                model = configured
+        else:
+            model = defaults["model"]
+
         return defaults, model
 
     def _get_client(self):
@@ -74,7 +94,6 @@ class RelationExtractor:
             import anthropic
             self._client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
         else:
-            # OpenAI-compatible clients: openai, moonshot, openrouter, groq
             import openai
             base_url = defaults.get("base_url")
 
@@ -98,6 +117,14 @@ class RelationExtractor:
 
         return self._client
 
+    @staticmethod
+    def _extract_retry_after(error_text: str) -> float:
+        """Parse Groq's 'Please try again in 24.68s' message."""
+        match = re.search(r"try again in ([\d.]+)s", error_text, re.IGNORECASE)
+        if match:
+            return float(match.group(1))
+        return None
+
     def extract_relations(self, event: EventModel) -> LLMRelationResponse:
         defaults, model = self._get_config()
         client = self._get_client()
@@ -115,7 +142,6 @@ class RelationExtractor:
                     )
                     content = response.content[0].text
                 else:
-                    # OpenAI-compatible API
                     response = client.chat.completions.create(
                         model=model,
                         messages=[
@@ -154,10 +180,25 @@ class RelationExtractor:
                 )
 
             except Exception as e:
-                log.warning("llm_extraction_failed", attempt=attempt, provider=self.provider, error=str(e))
-                time.sleep(1)
+                error_str = str(e)
+                is_rate_limit = "429" in error_str or "rate_limit" in error_str.lower()
 
-        # Fallback
+                if is_rate_limit:
+                    retry_after = self._extract_retry_after(error_str)
+                    sleep_time = retry_after or (2 ** attempt * 5)  # 5s, 10s, 20s
+                    log.warning(
+                        "rate_limit_hit",
+                        attempt=attempt,
+                        provider=self.provider,
+                        sleep_seconds=sleep_time,
+                        event_id=event.event_id
+                    )
+                    time.sleep(sleep_time)
+                else:
+                    log.warning("llm_extraction_failed", attempt=attempt, provider=self.provider, error=error_str)
+                    time.sleep(1)
+
+        # Fallback after all retries exhausted
         return LLMRelationResponse(
             event_label="Unknown Event",
             triples=[],
@@ -165,9 +206,38 @@ class RelationExtractor:
         )
 
     def extract_batch(self, events: List[EventModel]) -> List[LLMRelationResponse]:
-        results = []
-        for event in events:
-            result = self.extract_relations(event)
-            results.append(result)
-            time.sleep(1)  # Rate limiting
+        if not events:
+            return []
+
+        if len(events) <= 2:
+            return [self.extract_relations(e) for e in events]
+
+        results: List[LLMRelationResponse] = [None] * len(events)
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {}
+            for i, event in enumerate(events):
+                future = executor.submit(self.extract_relations, event)
+                futures[future] = i
+                # Slower stagger for Groq's 6000 TPM limit
+                if i < len(events) - 1:
+                    time.sleep(0.5)
+
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    log.warning(
+                        "batch_extraction_failed",
+                        event_id=events[idx].event_id,
+                        idx=idx,
+                        error=str(e)
+                    )
+                    results[idx] = LLMRelationResponse(
+                        event_label="Unknown Event",
+                        triples=[],
+                        discovered_entity_types=[]
+                    )
+
         return results

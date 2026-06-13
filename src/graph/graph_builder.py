@@ -63,18 +63,45 @@ class GraphBuilder:
                 original_relation=triple.relation
             )
 
-    def build_from_relations(self, events: List[EventModel], llm_responses: List[LLMRelationResponse], 
-                            entity_map: Dict[str, CanonicalEntity] = None) -> nx.DiGraph:
+    def build_from_relations(self, events: List[EventModel], llm_responses: List[LLMRelationResponse],
+                             entity_map: Dict[str, CanonicalEntity] = None) -> nx.DiGraph:
+        # BUG FIX: LLM triples carry entity *names* (e.g. "Russia") as source/
+        # target, but canonical entities are keyed by UUID.  The original code
+        # checked `entity.canonical_id in self.graph` which was ALWAYS False —
+        # every canonical entity ended up as an isolated orphan node, completely
+        # disconnected from the relation edges that used name-strings.
+        #
+        # Fix: build a lowercase name → canonical_id lookup from the entity_map
+        # BEFORE processing triples, then resolve each triple's source/target to
+        # its canonical ID so all edges point at the right node keys.
+        name_to_canonical_id: Dict[str, str] = {}
+        if entity_map:
+            for entity in entity_map.values():
+                name_to_canonical_id[entity.canonical_name.lower()] = entity.canonical_id
+                for alias in (entity.aliases or []):
+                    name_to_canonical_id[alias.lower()] = entity.canonical_id
+
         for event, response in zip(events, llm_responses):
             self.add_event_node(event, response.event_label)
 
             for triple in response.triples:
-                self.add_relation(triple, event.event_id)
+                # Resolve entity names → canonical UUIDs (fall back to raw name
+                # if the entity was never resolved, so the node still appears).
+                resolved = triple.model_copy(deep=True)
+                if resolved.source:
+                    resolved.source = name_to_canonical_id.get(
+                        resolved.source.lower(), resolved.source
+                    )
+                if resolved.target:
+                    resolved.target = name_to_canonical_id.get(
+                        resolved.target.lower(), resolved.target
+                    )
+                self.add_relation(resolved, event.event_id)
 
         if entity_map:
             for entity in entity_map.values():
                 if entity.canonical_id in self.graph:
-                    # Update node attributes if entity already added via edge
+                    # Node already created by add_relation above — enrich attrs.
                     self.graph.nodes[entity.canonical_id].update({
                         "name": entity.canonical_name,
                         "type": entity.entity_type,
@@ -82,6 +109,7 @@ class GraphBuilder:
                         "aliases": entity.aliases
                     })
                 else:
+                    # Entity appeared in NER but not in any LLM triple.
                     self.add_entity_node(entity)
 
         log.info("graph_built", nodes=self.graph.number_of_nodes(), edges=self.graph.number_of_edges())

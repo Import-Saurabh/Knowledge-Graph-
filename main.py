@@ -6,7 +6,6 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-# Add src to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.ingestion.article_loader import ArticleLoader
@@ -34,10 +33,6 @@ log = get_logger(__name__)
 
 @contextmanager
 def managed_session():
-    """
-    Context manager that yields a DB session and guarantees
-    rollback on exception and proper close().
-    """
     session = get_session()
     try:
         yield session
@@ -54,7 +49,6 @@ def run_pipeline(args):
 
     init_db()
 
-    # Initialize shared components
     embedder = EmbeddingGenerator()
     chroma = ChromaManager()
     ontology = OntologyManager(chroma, embedder)
@@ -62,7 +56,6 @@ def run_pipeline(args):
     # Stage 1: Ingestion
     loader = ArticleLoader()
 
-    # Download articles if --download flag is set
     if args.download:
         downloader = NewsDownloader(
             language="en",
@@ -80,86 +73,104 @@ def run_pipeline(args):
         if articles:
             loader.ingest_to_db(articles)
 
-    # Load from directory (downloaded or existing files)
     articles = loader.load_from_directory(args.input)
     result = loader.ingest_to_db(articles)
     log.info("ingestion_complete", **result)
 
-    # Get unprocessed articles
-    unprocessed = loader.get_unprocessed_articles("ingested")
-    if not unprocessed:
+    # Resume logic
+    if args.from_stage <= 2:
+        unprocessed = loader.get_unprocessed_articles("ingested")
+    elif args.from_stage <= 6:
+        unprocessed = (
+            loader.get_unprocessed_articles("ingested") or
+            loader.get_unprocessed_articles("embedded") or
+            loader.get_unprocessed_articles("deduplicated")
+        )
+    else:
+        unprocessed = (
+            loader.get_unprocessed_articles("embedded") or
+            loader.get_unprocessed_articles("deduplicated") or
+            loader.get_unprocessed_articles("clustered")
+        )
+
+    if not unprocessed and args.from_stage <= 2:
         log.info("no_new_articles")
         return
 
     # Stage 2: NER
-    extractor = EntityExtractor(
-        use_spacy_fallback=args.fast,
-        ontology_manager=ontology
-    )
     all_mentions = []
     article_to_mentions = {}
+    if args.from_stage <= 2:
+        extractor = EntityExtractor(
+            use_spacy_fallback=args.fast,
+            ontology_manager=ontology
+        )
 
-    for i in range(0, len(unprocessed), settings.NER_BATCH_SIZE):
-        batch = unprocessed[i:i + settings.NER_BATCH_SIZE]
-        try:
-            batch_mentions = extractor.extract_batch(batch)
-            for article, mentions in zip(batch, batch_mentions):
-                article_to_mentions[article.id] = mentions
-                all_mentions.extend(mentions)
-        except Exception as e:
-            log.error("extraction_batch_failed", error=str(e))
-            for article in batch:
-                try:
-                    mentions = extractor.extract_single(article)
+        for i in range(0, len(unprocessed), settings.NER_BATCH_SIZE):
+            batch = unprocessed[i:i + settings.NER_BATCH_SIZE]
+            try:
+                batch_mentions = extractor.extract_batch(batch)
+                for article, mentions in zip(batch, batch_mentions):
                     article_to_mentions[article.id] = mentions
                     all_mentions.extend(mentions)
-                except Exception as inner_e:
-                    log.error("extraction_single_failed", article_id=article.id, error=str(inner_e))
+            except Exception as e:
+                log.error("extraction_batch_failed", error=str(e))
+                for article in batch:
+                    try:
+                        mentions = extractor.extract_single(article)
+                        article_to_mentions[article.id] = mentions
+                        all_mentions.extend(mentions)
+                    except Exception as inner_e:
+                        log.error("extraction_single_failed", article_id=article.id, error=str(inner_e))
 
-    log.info("ner_complete", mentions=len(all_mentions))
+        log.info("ner_complete", mentions=len(all_mentions))
 
     # Stage 3: Entity Resolution
-    resolver = EntityResolver(chroma, embedder)
     canonical_map = {}
+    if args.from_stage <= 3:
+        resolver = EntityResolver(chroma, embedder)
 
-    for mention in all_mentions:
-        try:
-            canonical = resolver.resolve(mention)
-            canonical_map[canonical.canonical_id] = canonical
-        except Exception as e:
-            log.warning("resolution_failed", mention=mention.text, error=str(e))
+        for mention in all_mentions:
+            try:
+                canonical = resolver.resolve(mention)
+                canonical_map[canonical.canonical_id] = canonical
+            except Exception as e:
+                log.warning("resolution_failed", mention=mention.text, error=str(e))
 
-    log.info("resolution_complete", canonical_entities=len(canonical_map))
+        log.info("resolution_complete", canonical_entities=len(canonical_map))
 
     # Stage 4+5: Article Embeddings + ChromaDB
-    article_embeddings = embedder.embed_articles(unprocessed)
-    chroma.add_articles(
-        ids=[a[0] for a in article_embeddings],
-        embeddings=[a[1] for a in article_embeddings],
-        metadatas=[{"title": a.title, "source": a.source} for a in unprocessed]
-    )
-
-    loader.update_status([a.id for a in unprocessed], "embedded")
+    if args.from_stage <= 4:
+        article_embeddings = embedder.embed_articles(unprocessed)
+        chroma.add_articles(
+            ids=[a[0] for a in article_embeddings],
+            embeddings=[a[1] for a in article_embeddings],
+            metadatas=[{"title": a.title, "source": a.source} for a in unprocessed]
+        )
+        loader.update_status([a.id for a in unprocessed], "embedded")
 
     # Stage 6: Deduplication
-    dedup = DuplicateDetector(chroma, embedder)
-    duplicates = dedup.find_duplicates(unprocessed)
-    if duplicates:
-        dedup.mark_duplicates(duplicates)
-
-    non_dup_articles = [a for a in unprocessed if a.id not in {d[0] for d in duplicates}]
-    loader.update_status([a.id for a in non_dup_articles], "deduplicated")
+    if args.from_stage <= 6:
+        dedup = DuplicateDetector(chroma, embedder)
+        duplicates = dedup.find_duplicates(unprocessed)
+        if duplicates:
+            dedup.mark_duplicates(duplicates)
+        non_dup_articles = [a for a in unprocessed if a.id not in {d[0] for d in duplicates}]
+        loader.update_status([a.id for a in non_dup_articles], "deduplicated")
+    else:
+        non_dup_articles = unprocessed
 
     # Stage 7: Clustering
-    # Pass the shared embedder so EventClusterer does NOT reload the BGE model
-    # from disk for every temporal window.  Without this, each window pays a
-    # 5-10s model-load penalty.
-    clusterer = EventClusterer(embedder=embedder)
-    clusters = clusterer.run_all_windows(non_dup_articles)
+    if args.from_stage <= 7:
+        clusterer = EventClusterer(embedder=embedder)
+        clusters = clusterer.run_all_windows(non_dup_articles)
 
-    # Stage 8: Event Building
-    builder = EventBuilder()
-    events = [builder.build_event(c) for c in clusters]
+        # Stage 8: Event Building
+        builder = EventBuilder()
+        events = [builder.build_event(c) for c in clusters]
+    else:
+        log.error("Resuming from stage > 7 is not yet supported because events must be re-loaded from DB.")
+        raise SystemExit(1)
 
     # Update article cluster assignments
     try:
@@ -180,14 +191,39 @@ def run_pipeline(args):
     # Stage 9: LLM Relations + Type Induction
     llm_responses = []
     if not args.skip_llm:
-        extractor_llm = RelationExtractor()
+        extractor_llm = RelationExtractor(max_workers=args.llm_workers)
         relation_ontology = RelationOntologyManager(chroma, embedder)
 
-        for event in events:
-            try:
-                response = extractor_llm.extract_relations(event)
-                llm_responses.append(response)
+        # --- PARALLEL EXTRACTION (I/O-bound) ---
+        total_events = len(events)
+        for i in range(0, total_events, args.llm_batch_size):
+            batch = events[i:i + args.llm_batch_size]
+            batch_end = min(i + args.llm_batch_size, total_events)
+            log.info(
+                "llm_extraction_batch",
+                batch_start=i,
+                batch_end=batch_end,
+                total=total_events,
+                workers=args.llm_workers
+            )
 
+            try:
+                batch_responses = extractor_llm.extract_batch(batch)
+                llm_responses.extend(batch_responses)
+            except Exception as e:
+                log.error("llm_batch_failed", batch_start=i, error=str(e))
+                llm_responses.extend([
+                    LLMRelationResponse(
+                        event_label="Unknown Event",
+                        triples=[],
+                        discovered_entity_types=[]
+                    )
+                    for _ in batch
+                ])
+
+        # --- SEQUENTIAL POST-PROCESSING (DB-bound, NOT thread-safe) ---
+        for event, response in zip(events, llm_responses):
+            try:
                 for triple in response.triples:
                     triple.relation_canonical = relation_ontology.normalize_relation(triple.relation)
                     triple.event_id = event.event_id
@@ -200,21 +236,16 @@ def run_pipeline(args):
                             disc.get("suggested_type")
                         )
             except Exception as e:
-                log.warning("llm_extraction_failed", event_id=event.event_id, error=str(e))
-                llm_responses.append(LLMRelationResponse(
-                    event_label="Unknown Event",
-                    triples=[],
-                    discovered_entity_types=[]
-                ))
-
-            time.sleep(1)
+                log.warning("llm_post_processing_failed", event_id=event.event_id, error=str(e))
     else:
-        for event in events:
-            llm_responses.append(LLMRelationResponse(
-                event_label=f"Event {event.cluster_id}",
+        llm_responses = [
+            LLMRelationResponse(
+                event_label=f"Event {e.cluster_id}",
                 triples=[],
                 discovered_entity_types=[]
-            ))
+            )
+            for e in events
+        ]
 
     # Stage 10: Graph Building
     graph_builder = GraphBuilder()
@@ -250,9 +281,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="data/raw/")
     parser.add_argument("--run-all", action="store_true")
+    parser.add_argument("--from-stage", type=int, default=1, metavar="N",
+                        help="Resume pipeline from stage N (1=ingest, 2=NER, 3=entity-resolution, "
+                             "4=embeddings, 6=dedup, 7=clustering, 9=relations). "
+                             "Skipped stages are assumed already complete.")
     parser.add_argument("--fast", action="store_true", help="Use spaCy fallback for NER")
     parser.add_argument("--skip-llm", action="store_true", help="Skip LLM relation extraction")
     parser.add_argument("--daily", action="store_true", help="Daily mode: only process new articles")
+
+    # LLM batching controls
+    parser.add_argument("--llm-batch-size", type=int, default=10,
+                        help="Number of events per LLM batch (default: 10)")
+    parser.add_argument("--llm-workers", type=int, default=5,
+                        help="Max concurrent LLM API calls (default: 5)")
 
     # Download arguments
     parser.add_argument("--download", action="store_true",

@@ -25,7 +25,6 @@ class RelationOntologyManager:
     def normalize_relation(self, relation_text: str) -> str:
         cleaned = self._preprocess(relation_text)
 
-        # Search existing relations
         embedding = None
         try:
             embedding = self.embedder.embed_text(cleaned)
@@ -43,7 +42,6 @@ class RelationOntologyManager:
                         similarity = 1.0 - min(top_dist, 1.0)
                         if similarity > RELATION_SIMILARITY_THRESHOLD:
                             self._increment_usage(ids[0])
-                            # Get canonical form
                             session = get_session()
                             rel = session.query(RelationOntologyDB).filter_by(relation_id=ids[0]).first()
                             canonical = rel.relation_canonical if rel else cleaned
@@ -52,25 +50,27 @@ class RelationOntologyManager:
             except Exception as e:
                 log.warning("relation_search_failed", error=str(e))
 
-        # Create new relation entry
         return self._create_relation_entry(cleaned, embedding, relation_text)
 
     def _create_relation_entry(self, cleaned: str, embedding, original_text: str) -> str:
         session = get_session()
         existing = session.query(RelationOntologyDB).filter_by(relation_text=original_text).first()
         if existing:
+            # BUG FIX: read the attribute BEFORE closing the session
+            canonical = existing.relation_canonical or cleaned
             session.close()
-            return existing.relation_canonical or cleaned
+            return canonical
 
         relation_id = str(uuid.uuid4())
         emb_bytes = None
         if embedding:
             emb_bytes = np.array(embedding, dtype=np.float32).tobytes()
 
+        canonical = cleaned.upper().replace(" ", "_")
         db_rel = RelationOntologyDB(
             relation_id=relation_id,
             relation_text=original_text,
-            relation_canonical=cleaned.upper().replace(" ", "_"),
+            relation_canonical=canonical,
             relation_embedding=emb_bytes,
             usage_count=1,
             first_seen=datetime.utcnow(),
@@ -78,6 +78,8 @@ class RelationOntologyManager:
         )
         session.add(db_rel)
         session.commit()
+        # Capture value before session closes to avoid DetachedInstanceError
+        canonical = db_rel.relation_canonical
         session.close()
 
         if embedding and self.chroma:
@@ -87,15 +89,15 @@ class RelationOntologyManager:
                     embeddings=[embedding],
                     metadatas=[{
                         "relation_text": original_text,
-                        "relation_canonical": cleaned.upper().replace(" ", "_"),
+                        "relation_canonical": canonical,
                         "usage_count": 1
                     }]
                 )
             except Exception as e:
                 log.warning("relation_chroma_add_failed", error=str(e))
 
-        log.info("new_relation_created", text=original_text, canonical=db_rel.relation_canonical)
-        return db_rel.relation_canonical
+        log.info("new_relation_created", text=original_text, canonical=canonical)
+        return canonical
 
     def _increment_usage(self, relation_id: str):
         session = get_session()
@@ -127,10 +129,8 @@ class RelationOntologyManager:
                     clusters[label] = []
                 clusters[label].append(ids[i])
 
-            # Update canonical forms based on clusters
             session = get_session()
             for cluster_id, relation_ids in clusters.items():
-                # Use most frequent as canonical
                 rels = session.query(RelationOntologyDB).filter(
                     RelationOntologyDB.relation_id.in_(relation_ids)
                 ).order_by(RelationOntologyDB.usage_count.desc()).all()
