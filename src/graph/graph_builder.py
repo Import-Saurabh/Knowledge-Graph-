@@ -1,15 +1,18 @@
 """
 src/graph/graph_builder.py
+
 Builds a NetworkX DiGraph from:
   • LLM relation triples  (event-scoped, high-precision)
   • GLiREL raw triples    (article-scoped, zero-shot, high-recall)
 
-GLiREL integration:
-  build_from_relations() now accepts glirel_triples: List[dict].
-  Each dict has keys: head, relation, tail, score, article_id
-  These become direct entity→entity edges tagged source="glirel".
-  They go through the same name→canonical_id resolver so they land
-  on the correct node keys — not orphaned string nodes.
+Changes vs previous version:
+  - Confidence thresholds: LLM edges require confidence > LLM_CONF_THRESHOLD (0.7),
+    GLiREL edges require score > GLIREL_SCORE_THRESHOLD (0.5).
+  - Low-degree pruning: after graph build, nodes with degree < MIN_NODE_DEGREE (2)
+    are removed (Event nodes are exempt).
+  - Community detection: Louvain communities computed on the undirected projection;
+    each node receives a `community_id` attribute used by the exporter for colouring.
+  - All thresholds are class-level constants so callers can override them.
 """
 
 import networkx as nx
@@ -24,6 +27,14 @@ log = get_logger(__name__)
 
 
 class GraphBuilder:
+    # ------------------------------------------------------------------
+    # Tuneable thresholds  (override on the instance if needed)
+    # ------------------------------------------------------------------
+    LLM_CONF_THRESHOLD:   float = 0.70   # drop LLM triples below this
+    GLIREL_SCORE_THRESHOLD: float = 0.50  # drop GLiREL triples below this
+    MIN_NODE_DEGREE:      int   = 2       # prune nodes with degree < this
+    #   Event nodes are never pruned regardless of degree.
+
     def __init__(self):
         self.graph = nx.DiGraph()
 
@@ -66,6 +77,10 @@ class GraphBuilder:
     # ------------------------------------------------------------------
 
     def add_relation(self, triple: RelationTriple, event_id: str) -> None:
+        """Add LLM triple edges.  Silently drops if confidence is below threshold."""
+        if triple.confidence < self.LLM_CONF_THRESHOLD:
+            return
+
         # Entity → PARTICIPATES_IN → Event
         if triple.source and event_id:
             self.graph.add_edge(
@@ -110,12 +125,15 @@ class GraphBuilder:
     ) -> None:
         """
         Add a GLiREL-sourced entity→entity edge.
+        Scores below GLIREL_SCORE_THRESHOLD are silently dropped.
         If the same edge already exists from LLM extraction, keep the LLM
-        version (higher precision) but record that GLiREL also saw it.
+        version (higher precision) but record that GLiREL also confirmed it.
         """
+        if score < self.GLIREL_SCORE_THRESHOLD:
+            return
+
         if self.graph.has_edge(head_id, tail_id):
             existing = self.graph[head_id][tail_id]
-            # Merge: note glirel confirmation on the existing edge
             existing.setdefault("glirel_confirmed", True)
             existing.setdefault("glirel_score", score)
             return
@@ -124,13 +142,68 @@ class GraphBuilder:
             head_id, tail_id,
             relation=relation,
             confidence=score,
-            event_id="",          # GLiREL triples are article-scoped, not event-scoped
+            event_id="",
             article_id=article_id,
             original_relation=relation,
             source="glirel",
             glirel_confirmed=True,
             glirel_score=score,
         )
+
+    # ------------------------------------------------------------------
+    # Post-processing
+    # ------------------------------------------------------------------
+
+    def _prune_low_degree_nodes(self) -> int:
+        """
+        Remove nodes whose (undirected) degree is below MIN_NODE_DEGREE.
+        Event nodes are always kept.
+        Returns the number of nodes removed.
+        """
+        to_remove = [
+            n for n, data in self.graph.nodes(data=True)
+            if data.get("type") != "Event"
+            and self.graph.degree(n) < self.MIN_NODE_DEGREE
+        ]
+        self.graph.remove_nodes_from(to_remove)
+        return len(to_remove)
+
+    def _assign_communities(self) -> int:
+        """
+        Run Louvain community detection on the undirected projection of the
+        graph and write `community_id` (int) onto every node.
+        Returns the number of communities found.
+
+        Falls back gracefully if python-louvain / networkx-community is not
+        installed — all nodes get community_id = 0.
+        """
+        undirected = self.graph.to_undirected()
+        try:
+            # networkx >= 3.x ships greedy_modularity_communities
+            from networkx.algorithms.community import louvain_communities
+            communities = louvain_communities(undirected, seed=42)
+        except (ImportError, AttributeError):
+            try:
+                from networkx.algorithms.community import (
+                    greedy_modularity_communities,
+                )
+                communities = list(greedy_modularity_communities(undirected))
+            except Exception:
+                log.warning(
+                    "community_detection_unavailable",
+                    hint="Install networkx >= 3.0 for Louvain support. "
+                         "All nodes assigned community_id=0.",
+                )
+                for n in self.graph.nodes():
+                    self.graph.nodes[n]["community_id"] = 0
+                return 1
+
+        for community_id, members in enumerate(communities):
+            for node in members:
+                if node in self.graph:
+                    self.graph.nodes[node]["community_id"] = community_id
+
+        return len(communities)
 
     # ------------------------------------------------------------------
     # Main builder
@@ -145,16 +218,17 @@ class GraphBuilder:
     ) -> nx.DiGraph:
         """
         Build the graph from three sources:
-          1. entity_map   — canonical entity nodes (from GLiNER + resolution)
-          2. llm_responses — LLM relation triples (event-scoped, high precision)
+          1. entity_map     — canonical entity nodes (from GLiNER + resolution)
+          2. llm_responses  — LLM relation triples (event-scoped, high precision)
           3. glirel_triples — GLiREL raw triples (article-scoped, high recall)
 
-        All entity name strings in LLM and GLiREL triples are resolved to
-        canonical UUIDs via `name_to_canonical_id` so every edge lands on
-        the correct node rather than creating orphaned string nodes.
+        Post-processing applied automatically:
+          • Confidence/score filtering (edges below threshold are never added).
+          • Low-degree node pruning (nodes with degree < MIN_NODE_DEGREE removed).
+          • Community detection (Louvain); community_id written to every node.
         """
 
-        # Step 0: build name → canonical_id lookup (used by both LLM + GLiREL)
+        # ── Step 0: name → canonical_id lookup ──────────────────────────
         name_to_id: Dict[str, str] = {}
         if entity_map:
             for entity in entity_map.values():
@@ -162,13 +236,17 @@ class GraphBuilder:
                 for alias in (entity.aliases or []):
                     name_to_id[alias.lower()] = entity.canonical_id
 
-        # ------------------------------------------------------------------
-        # Step 1: LLM triples (event-scoped)
-        # ------------------------------------------------------------------
+        # ── Step 1: LLM triples (event-scoped) ──────────────────────────
+        llm_kept = 0
+        llm_dropped = 0
         for event, response in zip(events, llm_responses):
             self.add_event_node(event, response.event_label)
 
             for triple in response.triples:
+                if triple.confidence < self.LLM_CONF_THRESHOLD:
+                    llm_dropped += 1
+                    continue
+
                 resolved = triple.model_copy(deep=True)
                 if resolved.source:
                     resolved.source = name_to_id.get(
@@ -179,10 +257,16 @@ class GraphBuilder:
                         resolved.target.lower(), resolved.target
                     )
                 self.add_relation(resolved, event.event_id)
+                llm_kept += 1
 
-        # ------------------------------------------------------------------
-        # Step 2: Enrich / add canonical entity nodes
-        # ------------------------------------------------------------------
+        log.info(
+            "llm_triples_filtered",
+            kept=llm_kept,
+            dropped=llm_dropped,
+            threshold=self.LLM_CONF_THRESHOLD,
+        )
+
+        # ── Step 2: canonical entity nodes ──────────────────────────────
         if entity_map:
             for entity in entity_map.values():
                 if entity.canonical_id in self.graph:
@@ -195,32 +279,31 @@ class GraphBuilder:
                 else:
                     self.add_entity_node(entity)
 
-        # ------------------------------------------------------------------
-        # Step 3: GLiREL triples (article-scoped, direct entity→entity edges)
-        # ------------------------------------------------------------------
+        # ── Step 3: GLiREL triples (article-scoped) ──────────────────────
         glirel_added   = 0
         glirel_merged  = 0
+        glirel_dropped = 0
 
         if glirel_triples:
             for t in glirel_triples:
                 head_raw = (t.get("head") or "").strip()
                 tail_raw = (t.get("tail") or "").strip()
                 relation = (t.get("relation") or "").strip()
-                score    = float(t.get("score", 0.5))
+                score    = float(t.get("score", 0.0))
                 art_id   = t.get("article_id", "")
 
                 if not head_raw or not tail_raw or not relation:
                     continue
                 if head_raw.lower() == tail_raw.lower():
-                    continue  # skip self-loops
+                    continue
 
-                # Resolve to canonical IDs; fall back to the raw name string
-                # so the entity still appears in the graph even if it was
-                # never resolved (e.g., only appears in one article).
+                if score < self.GLIREL_SCORE_THRESHOLD:
+                    glirel_dropped += 1
+                    continue
+
                 head_id = name_to_id.get(head_raw.lower(), head_raw)
                 tail_id = name_to_id.get(tail_raw.lower(), tail_raw)
 
-                # Ensure both endpoints exist as nodes
                 self._ensure_entity_stub(head_id, head_raw)
                 self._ensure_entity_stub(tail_id, tail_raw)
 
@@ -233,12 +316,36 @@ class GraphBuilder:
                     glirel_added += 1
 
         log.info(
+            "glirel_triples_filtered",
+            added=glirel_added,
+            merged=glirel_merged,
+            dropped=glirel_dropped,
+            threshold=self.GLIREL_SCORE_THRESHOLD,
+        )
+
+        # ── Step 4: Prune low-degree nodes ───────────────────────────────
+        pruned = self._prune_low_degree_nodes()
+        log.info(
+            "low_degree_pruning",
+            nodes_removed=pruned,
+            min_degree=self.MIN_NODE_DEGREE,
+        )
+
+        # ── Step 5: Community detection ───────────────────────────────────
+        n_communities = self._assign_communities()
+        log.info(
+            "community_detection_complete",
+            communities=n_communities,
+        )
+
+        log.info(
             "graph_built",
             nodes=self.graph.number_of_nodes(),
             edges=self.graph.number_of_edges(),
             llm_events=len(events),
             glirel_new_edges=glirel_added,
             glirel_merged_edges=glirel_merged,
+            communities=n_communities,
         )
         return self.graph
 
@@ -250,10 +357,13 @@ class GraphBuilder:
         types     = set()
         relations = set()
         sources   = {"llm": 0, "glirel": 0, "unknown": 0}
+        communities: set = set()
 
         for _, data in self.graph.nodes(data=True):
             if "type" in data:
                 types.add(data["type"])
+            if "community_id" in data:
+                communities.add(data["community_id"])
 
         for _, _, data in self.graph.edges(data=True):
             if "relation" in data:
@@ -267,4 +377,8 @@ class GraphBuilder:
             "entity_types_discovered":   len(types) - (1 if "Event" in types else 0),
             "relation_types_discovered": len(relations),
             "edges_by_source":           sources,
+            "communities_detected":      len(communities),
+            "llm_conf_threshold":        self.LLM_CONF_THRESHOLD,
+            "glirel_score_threshold":    self.GLIREL_SCORE_THRESHOLD,
+            "min_node_degree":           self.MIN_NODE_DEGREE,
         }

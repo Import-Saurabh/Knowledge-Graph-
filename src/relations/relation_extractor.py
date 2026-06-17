@@ -1,25 +1,19 @@
 """
 src/relations/relation_extractor.py
+
 LLM-based relation + event-label extractor.
 
-Rate-limit fix (root cause & solution):
-  The previous _RateLimiter had a race condition: it updated _last_call
-  *inside* the lock but *before* the HTTP call.  A second thread would
-  acquire the lock, see the freshly-written timestamp, wait the full
-  min_interval, then fire — making both calls land nearly simultaneously.
-  The fix:
-    1.  _last_call is updated AFTER the HTTP call returns (or raises), so
-        the measured gap is the true wall-clock distance between call completions.
-    2.  min_interval raised from 2.1 s → 3.5 s (~17 RPM sustained), giving
-        comfortable headroom under Groq free-tier burst limits.
-    3.  The lock is held for the *entire* acquire-→-call-→-release cycle via
-        a reentrant design: threads queue up on the lock and the one that holds
-        it owns the call slot, preventing any two calls from overlapping.
-    4.  extract_batch falls back to pure sequential execution for Groq
-        (max_workers forced to 1 at the provider level) so the rate limiter
-        is never stressed by concurrent threads.
-  All other behaviour (provider routing, JSON parsing, GLiREL triples,
-  fallback LLMRelationResponse) is unchanged.
+Changes vs previous version:
+  - LLM_SYSTEM_PROMPT now instructs the model to pick from a predefined
+    controlled vocabulary (CANONICAL_RELATION_LIST).  Both the canonical
+    label AND the original raw phrase are returned in every triple so the
+    graph stores both: raw for human readability, canonical for querying.
+  - Triple parsing handles the new `relation_raw` field and populates
+    RelationTriple.relation (raw) + RelationTriple.relation_canonical.
+  - If the model returns a label that is NOT in the vocabulary the extractor
+    validates it in _validate_canonical(); unknown labels are remapped via
+    the relation_ontology at call-site rather than silently stored as-is.
+  - All rate-limit / retry / provider-routing logic is unchanged.
 """
 
 import json
@@ -68,69 +62,137 @@ class _RateLimiter:
         self._lock = threading.Lock()
         self._last_call: float = 0.0
         self.min_interval = min_interval
-        self._token = object()  # sentinel — updated each cycle
+        self._token = object()
 
     def acquire(self) -> object:
-        """Block until a call slot is available.  Returns an opaque token."""
         self._lock.acquire()
         now  = time.monotonic()
         wait = self.min_interval - (now - self._last_call)
         if wait > 0:
             time.sleep(wait)
-        # Return the sentinel; caller passes it back to release() as a
-        # lightweight guard against mismatched acquire/release calls.
         return self._token
 
     def release(self, token: object) -> None:
-        """Record call completion time and free the lock."""
         if token is not self._token:
-            # Mismatched token — still release the lock to avoid deadlock.
             self._lock.release()
             raise RuntimeError("_RateLimiter.release() called with wrong token")
         self._last_call = time.monotonic()
         self._lock.release()
 
 
-_RATE_LIMITER = _RateLimiter(min_interval=3.5)   # ~17 RPM — safe for Groq 30 RPM free tier
+_RATE_LIMITER = _RateLimiter(min_interval=3.5)
+
 
 # ---------------------------------------------------------------------------
+# Controlled vocabulary — MUST stay in sync with relation_ontology.py
+# The LLM is instructed to pick exactly one label from this list.
+# ---------------------------------------------------------------------------
 
-LLM_SYSTEM_PROMPT = """
-You are a knowledge graph extractor.
-Given an event context, perform two tasks:
+CANONICAL_RELATION_LIST: List[str] = [
+    # Military / Conflict
+    "MILITARY_ATTACK",
+    "MILITARY_OCCUPATION",
+    "MILITARY_WITHDRAWAL",
+    "MILITARY_SUPPORT",
+    "CEASEFIRE",
+    # Diplomatic
+    "DIPLOMATIC_MEETING",
+    "DIPLOMATIC_AGREEMENT",
+    "DIPLOMATIC_RECOGNITION",
+    "DIPLOMATIC_EXPULSION",
+    "DIPLOMATIC_STATEMENT",
+    "PEACE_NEGOTIATION",
+    # Sanctions / Economic
+    "SANCTIONS_IMPOSED",
+    "SANCTIONS_LIFTED",
+    "TRADE_AGREEMENT",
+    "ECONOMIC_AID",
+    "INVESTMENT",
+    # Leadership / Political
+    "LEADER_OF",
+    "APPOINTED",
+    "RESIGNED",
+    "ALLY_OF",
+    "OPPOSES",
+    # Legal / Criminal
+    "ACCUSED_OF",
+    "CONVICTED_OF",
+    "ARRESTED",
+    # Organisational
+    "MEMBER_OF",
+    "FOUNDED",
+    "HEADQUARTERED_IN",
+    # Humanitarian / Population
+    "HUMANITARIAN_AID",
+    "REFUGEE_MOVEMENT",
+    # Nuclear / Security
+    "NUCLEAR_ACTIVITY",
+    # Generic fallback — use sparingly
+    "RELATED_TO",
+]
 
-TASK 1 - Event & Relations:
-Extract a short event label and entity relation triples.
-Relations should be described as natural language verbs/phrases
-(e.g., "launched airstrike against", "signed trade deal with", "imposed sanctions on").
-DO NOT use a fixed relation list. Describe the action in 2-5 words.
+_CANONICAL_SET = set(CANONICAL_RELATION_LIST)
 
-TASK 2 - Entity Type Induction:
-For any entities whose type seems unclear or too generic, suggest a specific
-fine-grained type.
+# ---------------------------------------------------------------------------
+# System prompt — enforces controlled vocabulary at the LLM level
+# ---------------------------------------------------------------------------
+
+_VOCAB_BLOCK = "\n".join(f"  - {r}" for r in CANONICAL_RELATION_LIST)
+
+LLM_SYSTEM_PROMPT = f"""
+You are a knowledge graph extractor for news and geopolitical events.
+Given an event context, perform two tasks.
+
+══════════════════════════════════════════════════════════════
+TASK 1 — Event label and relation triples
+══════════════════════════════════════════════════════════════
+Extract a short event label (≤ 8 words) and entity relation triples.
+
+For each triple you MUST:
+  1. Write the raw phrase that best describes the relation in the text
+     (2–5 natural-language words, e.g. "launched airstrikes against").
+     Store this in the `relation` field — it is kept for human readability.
+  2. Pick the single BEST-MATCHING canonical label from the list below
+     and store it in `relation_canonical`.
+     Use "RELATED_TO" only if no other label clearly fits.
+
+CANONICAL RELATION VOCABULARY (pick exactly one per triple):
+{_VOCAB_BLOCK}
+
+══════════════════════════════════════════════════════════════
+TASK 2 — Entity type induction
+══════════════════════════════════════════════════════════════
+For any entity whose type seems too generic, suggest a fine-grained type.
 Examples: "Biotechnology Company", "Non-State Armed Group",
           "Regional Trade Bloc", "Space Agency".
 
-Output ONLY valid JSON:
-{
-  "event_label": "string",
+══════════════════════════════════════════════════════════════
+OUTPUT — valid JSON only, no markdown fences
+══════════════════════════════════════════════════════════════
+{{
+  "event_label": "string (≤ 8 words)",
   "triples": [
-    {
-      "source": "canonical entity name",
-      "relation": "natural language relation phrase",
-      "target": "canonical entity name",
-      "confidence": 0.0-1.0
-    }
+    {{
+      "source":             "canonical entity name",
+      "relation":           "raw natural-language phrase (2–5 words)",
+      "relation_canonical": "ONE label from the vocabulary above",
+      "target":             "canonical entity name",
+      "confidence":         0.0–1.0
+    }}
   ],
   "discovered_types": [
-    {
-      "entity_name": "string",
+    {{
+      "entity_name":    "string",
       "suggested_type": "string",
-      "reasoning": "string"
-    }
+      "reasoning":      "string"
+    }}
   ]
-}
+}}
 """
+
+# ---------------------------------------------------------------------------
+# Provider defaults
+# ---------------------------------------------------------------------------
 
 PROVIDER_DEFAULTS = {
     "anthropic":  {"model": "claude-3-haiku-20240307",               "client": "anthropic"},
@@ -143,13 +205,8 @@ PROVIDER_DEFAULTS = {
                    "base_url": "https://api.groq.com/openai/v1"},
 }
 
-# Max workers per provider.
-# Groq: forced to 1. The rate limiter now serialises calls (one in-flight at
-# a time), so extra threads just queue up and add overhead without benefit.
-# Other providers can run concurrent calls because _RATE_LIMITER only
-# enforces a post-call gap; overlap is safe when RPM headroom exists.
 _PROVIDER_MAX_WORKERS = {
-    "groq":       1,   # serialised by _RATE_LIMITER — no benefit from >1
+    "groq":       1,
     "openrouter": 2,
     "openai":     5,
     "anthropic":  5,
@@ -157,14 +214,31 @@ _PROVIDER_MAX_WORKERS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _validate_canonical(label: str) -> str:
+    """
+    Return label if it is in the vocabulary.
+    Otherwise return "RELATED_TO" so the graph never stores raw LLM noise
+    as a canonical.  The ontology manager will remap it properly later.
+    """
+    if not label:
+        return "RELATED_TO"
+    normalized = label.strip().upper().replace(" ", "_")
+    return normalized if normalized in _CANONICAL_SET else "RELATED_TO"
+
+
+# ---------------------------------------------------------------------------
+
 class RelationExtractor:
     def __init__(self, provider: str = None, max_workers: int = 2):
-        self.provider     = (provider or settings.LLM_PROVIDER).lower().strip()
-        self._client      = None
+        self.provider    = (provider or settings.LLM_PROVIDER).lower().strip()
+        self._client     = None
         self._model: str | None = None
-        # Honour the caller's preference but never exceed the per-provider cap
-        provider_cap      = _PROVIDER_MAX_WORKERS.get(self.provider, max_workers)
-        self.max_workers  = min(max_workers, provider_cap)
+        provider_cap     = _PROVIDER_MAX_WORKERS.get(self.provider, max_workers)
+        self.max_workers = min(max_workers, provider_cap)
 
     # ------------------------------------------------------------------
     # Config & client
@@ -174,7 +248,7 @@ class RelationExtractor:
         defaults   = PROVIDER_DEFAULTS.get(self.provider, PROVIDER_DEFAULTS["groq"])
         configured = settings.LLM_MODEL
         if configured:
-            is_namespaced       = "/" in configured
+            is_namespaced        = "/" in configured
             provider_needs_plain = self.provider in ("groq", "openai", "anthropic", "moonshot")
             if provider_needs_plain and is_namespaced:
                 log.warning(
@@ -192,11 +266,11 @@ class RelationExtractor:
         return defaults, model
 
     def _get_client(self):
-        if self._client is not None:
+        if self._client:
             return self._client
 
         defaults, model = self._get_config()
-        self._model = model
+        self._model     = model
 
         if defaults["client"] == "anthropic":
             import anthropic
@@ -227,13 +301,11 @@ class RelationExtractor:
 
     @staticmethod
     def _extract_retry_after(error_text: str) -> float | None:
-        """Parse Groq 'Please try again in 24.68s' style messages."""
         m = re.search(r"try again in ([\d.]+)s", error_text, re.IGNORECASE)
         return float(m.group(1)) if m else None
 
     @staticmethod
     def _parse_json(content: str) -> dict:
-        """Strip markdown fences then parse JSON."""
         text = content
         if "```json" in text:
             text = text.split("```json", 1)[1].split("```", 1)[0]
@@ -251,14 +323,14 @@ class RelationExtractor:
 
         prompt = (
             f"Event Context:\n{event.context[:4000]}\n\n"
-            "Extract the event label, relations, and any discovered entity types."
+            "Extract the event label, relations (with canonical labels), "
+            "and any discovered entity types."
         )
 
-        max_attempts = 5   # raised from 3
+        max_attempts = 5
 
         for attempt in range(max_attempts):
             try:
-                # ── Serialise via rate limiter; hold slot for entire call ─
                 _token = _RATE_LIMITER.acquire()
                 try:
                     if defaults["client"] == "anthropic":
@@ -277,27 +349,58 @@ class RelationExtractor:
                                 {"role": "user",   "content": prompt},
                             ],
                             max_tokens=2000,
-                            temperature=0.3,
+                            temperature=0.2,   # lower than before — vocabulary compliance
                         )
                         content = response.choices[0].message.content
                 finally:
-                    # Always release — even if the HTTP call raises — so the
-                    # lock is never left held on a network error / timeout.
                     _RATE_LIMITER.release(_token)
 
                 data = self._parse_json(content)
 
-                triples = [
-                    RelationTriple(
-                        source=t.get("source", ""),
-                        relation=t.get("relation", ""),
-                        target=t.get("target", ""),
-                        confidence=t.get("confidence", 0.5),
-                        event_id=event.event_id,
-                        source_article_ids=event.article_ids,
+                # ── Parse triples ────────────────────────────────────────
+                triples = []
+                for t in data.get("triples", []):
+                    source   = (t.get("source")   or "").strip()
+                    relation  = (t.get("relation") or "").strip()
+                    target   = (t.get("target")   or "").strip()
+
+                    if not source or not relation or not target:
+                        log.warning(
+                            "skipping_invalid_triple",
+                            event_id=event.event_id,
+                            source=source,
+                            relation=relation,
+                            target=target,
+                        )
+                        continue
+
+                    confidence = t.get("confidence", 0.5)
+                    if not isinstance(confidence, (int, float)):
+                        confidence = 0.5
+
+                    # relation_canonical: validate against vocab; remap if needed
+                    raw_canonical = (t.get("relation_canonical") or "").strip()
+                    canonical     = _validate_canonical(raw_canonical)
+
+                    if raw_canonical and raw_canonical.upper() not in _CANONICAL_SET:
+                        log.debug(
+                            "canonical_remapped",
+                            event_id=event.event_id,
+                            llm_returned=raw_canonical,
+                            remapped_to=canonical,
+                        )
+
+                    triples.append(
+                        RelationTriple(
+                            source=source,
+                            relation=relation,            # raw phrase — preserved
+                            relation_canonical=canonical, # controlled-vocab label
+                            target=target,
+                            confidence=confidence,
+                            event_id=event.event_id,
+                            source_article_ids=event.article_ids,
+                        )
                     )
-                    for t in data.get("triples", [])
-                ]
 
                 return LLMRelationResponse(
                     event_label=data.get("event_label", "Unknown Event"),
@@ -306,12 +409,11 @@ class RelationExtractor:
                 )
 
             except Exception as e:
-                error_str    = str(e)
+                error_str     = str(e)
                 is_rate_limit = "429" in error_str or "rate_limit" in error_str.lower()
 
                 if is_rate_limit:
                     retry_after = self._extract_retry_after(error_str)
-                    # Add 1 s buffer on top of whatever Groq says
                     sleep_time  = (retry_after + 1.0) if retry_after else (2 ** attempt * 5)
                     log.warning(
                         "rate_limit_hit",
@@ -342,7 +444,6 @@ class RelationExtractor:
         if not events:
             return []
 
-        # For tiny batches just go sequential — no thread-pool overhead
         if len(events) <= 2 or self.max_workers == 1:
             return [self.extract_relations(e) for e in events]
 
@@ -353,8 +454,6 @@ class RelationExtractor:
             for i, event in enumerate(events):
                 future = executor.submit(self.extract_relations, event)
                 futures[future] = i
-                # Secondary stagger: gives the rate-limiter a head-start
-                # before the next thread tries to acquire it
                 if i < len(events) - 1:
                     time.sleep(0.5)
 
