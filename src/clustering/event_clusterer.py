@@ -12,18 +12,21 @@ class EventClusterer:
     """
     Clusters articles into events using embeddings.
 
-    Improvements over the original version:
+    Improvements:
     - Normalizes embeddings before clustering.
     - Uses a cosine-style clustering setup for better semantic grouping.
     - Falls back to a greedy similarity-based grouping when HDBSCAN produces
       only noise or no clusters.
     - Never silently returns zero clusters if there are enough articles to form
       at least one reasonable event.
+    - Allows singleton clusters (min_cluster_size=1) to avoid discarding
+      articles when data is sparse.
     """
 
     def __init__(self, embedder=None):
         self.window_days = getattr(settings, "TEMPORAL_WINDOW_DAYS", 7)
-        self.min_cluster_size = max(2, int(getattr(settings, "MIN_CLUSTER_SIZE", 2)))
+        # Allow singletons to ensure we always get clusters even with 2 articles.
+        self.min_cluster_size = max(1, int(getattr(settings, "MIN_CLUSTER_SIZE", 1)))
 
         # Shared embedder injected from the pipeline — avoids reloading the
         # model for every temporal window.
@@ -31,9 +34,9 @@ class EventClusterer:
         self._local_embedder = None  # fallback, lazily initialized once
 
         # Fallback similarity threshold for greedy grouping.
-        # Keep it moderately strict so unrelated articles do not merge.
+        # Lowered to merge more aggressively when data is sparse.
         self.fallback_similarity_threshold = float(
-            getattr(settings, "EVENT_SIMILARITY_THRESHOLD", 0.78)
+            getattr(settings, "EVENT_SIMILARITY_THRESHOLD", 0.65)
         )
 
     def _get_embedder(self):
@@ -143,7 +146,7 @@ class EventClusterer:
         # On unit vectors, Euclidean distance tracks cosine similarity closely.
         try:
             hdbscan_min_cluster_size = min(self.min_cluster_size, len(articles))
-            hdbscan_min_cluster_size = max(2, hdbscan_min_cluster_size)
+            hdbscan_min_cluster_size = max(1, hdbscan_min_cluster_size)  # allow singletons
 
             clusterer = hdbscan.HDBSCAN(
                 min_cluster_size=hdbscan_min_cluster_size,
@@ -249,14 +252,9 @@ class EventClusterer:
         result = []
         cluster_id = 0
 
+        # We now allow singleton clusters, so no filtering by min_cluster_size.
         for member_indices in cluster_members:
             cluster_articles = [articles[i] for i in member_indices]
-
-            # Keep singleton clusters only if there is no better structure.
-            # This ensures the pipeline still produces events instead of nothing.
-            if len(cluster_articles) < self.min_cluster_size and len(articles) >= self.min_cluster_size:
-                continue
-
             result.append({
                 "cluster_id": cluster_id,
                 "temporal_window": window,
@@ -265,8 +263,8 @@ class EventClusterer:
             })
             cluster_id += 1
 
-        # Final rescue: if everything got filtered out, create one cluster
-        # from the most similar article pair, or one big cluster as last resort.
+        # Final rescue: if everything got filtered out (should not happen now),
+        # create one cluster from all articles as last resort.
         if not result:
             if len(articles) >= 2:
                 result.append({

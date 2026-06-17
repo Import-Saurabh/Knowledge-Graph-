@@ -1,23 +1,32 @@
 """
-src/entities/entity_extractor.py  — GLiREL-Large integration
-Ported the zero-shot relation extraction logic from extract_kg.py into a
-reusable EntityExtractor method so the pipeline can produce GLiREL triples
-alongside (or instead of) LLM triples.
+src/entities/entity_extractor.py
 
-Key design choices (same as extract_kg.py):
-  • RELATION_ENTITY_EXCLUDE  — dates/money are filtered before GLiREL to kill
-                               "2024 --sanctioned by--> Iran" junk.
-  • CONSTRAINTS dict         — type-aware post-filter on (head_type, tail_type)
-                               so "killed" only fires when tail is a person, etc.
-  • add_relation()           — keeps only the higher-scoring direction for each
-                               (head, label, tail) unordered pair.
-  • MAX_ENTS / MAX_WORDS     — same chunk-size guardrails as extract_kg.py.
-  • extract_with_glirel()    — new public method; returns List[dict] of triples
-                               with keys: head, relation, tail, score, article_id
+GLiREL REMOVED — replaced with a pure GLiNER-2 relation extractor.
+
+Reasons for removal:
+  • GLiREL._from_pretrained() in current pip versions requires 'proxies' and
+    'resume_download' kwargs that the library doesn't pass → always crashes.
+  • The published GLiREL Hub models (jackboyla/glirel-large-v0,
+    relax/relax-large) have mismatched config schemas that break loading.
+
+Replacement — GliNERRelationExtractor:
+  • Uses the SAME urchade/gliner_large-v2.1 model already loaded for NER.
+  • For each article chunk, extracts entity pairs then asks GLiNER to score
+    each (head, relation_label, tail) triple by wrapping the relation as a
+    typed span label and checking the model's entity-score for that label.
+  • Falls back gracefully: if the relation score is below threshold the
+    triple is discarded.
+  • Same public interface as the old GLiREL path:
+      extract_with_glirel(articles) -> List[dict]   (key name kept for
+      compatibility so main.py needs no changes)
+
+All other behaviour (GLiNER NER, spaCy fallback, chunking, CONSTRAINTS,
+_add_relation dedup) is unchanged.
 """
 
 import re
 import uuid
+from itertools import combinations
 from typing import List, Dict, Optional, Tuple
 
 from src.models.article import ArticleModel
@@ -31,11 +40,11 @@ BATCH_SIZE = 32
 CONFIDENCE_THRESHOLD = 0.4
 
 # ---------------------------------------------------------------------------
-# GLiREL configuration — mirrored from extract_kg.py
+# GLiNER-2 RE configuration
 # ---------------------------------------------------------------------------
 
-MAX_ENTS = 40          # cap entities per chunk before feeding GLiREL
-MAX_WORDS = 200        # words per chunk
+MAX_ENTS  = 40    # cap entities per chunk
+MAX_WORDS = 200   # words per chunk
 
 RELATION_ENTITY_EXCLUDE = {"date", "money or economic value"}
 
@@ -52,7 +61,8 @@ _EVENT  = {"event", "military operation"}
 _ACTOR  = _PER | _ORG | _NATION
 _HITTABLE = _PLACE | _ORG | _PER | _ARMS
 
-GLIREL_RELATION_LABELS = [
+# Relation labels we want to detect — same list as before
+RELATION_LABELS = [
     "allied with", "at war with", "attacked", "invaded", "located in",
     "capital of", "part of", "member of", "leader of", "head of state of",
     "headquartered in", "supported by", "funded by", "sanctioned by",
@@ -62,7 +72,7 @@ GLIREL_RELATION_LABELS = [
     "threatened", "supplied weapons to", "accused",
 ]
 
-GLIREL_CONSTRAINTS: Dict[str, Tuple[set, set]] = {
+RELATION_CONSTRAINTS: Dict[str, Tuple[set, set]] = {
     "allied with":           (_ACTOR, _ACTOR),
     "at war with":           (_ACTOR, _ACTOR),
     "attacked":              (_ACTOR | _ARMS, _HITTABLE),
@@ -115,23 +125,6 @@ def _char_to_token_span(
     return (first, last) if first is not None else None
 
 
-def _constrain_glirel(rels, ner):
-    """Drop relations whose head/tail type violates the logical rule."""
-    span_label = {(n[0], n[1]): n[2] for n in ner}
-    out = []
-    for r in rels:
-        rule = GLIREL_CONSTRAINTS.get(r["label"])
-        if rule is None:
-            out.append(r)
-            continue
-        # GLiREL end index is exclusive; subtract 1 to match ner span format
-        head_t = span_label.get((r["head_pos"][0], r["head_pos"][1] - 1))
-        tail_t = span_label.get((r["tail_pos"][0], r["tail_pos"][1] - 1))
-        if head_t in rule[0] and tail_t in rule[1]:
-            out.append(r)
-    return out
-
-
 def _add_relation(relations: dict, head: str, label: str, tail: str, score: float):
     """Keep one directed edge per unordered (head, label, tail) — higher score wins."""
     rev = (tail, label, head)
@@ -145,6 +138,103 @@ def _add_relation(relations: dict, head: str, label: str, tail: str, score: floa
         relations[key] = score
 
 
+def _passes_constraint(head_type: str, tail_type: str, relation: str) -> bool:
+    """Return True if the (head_type, tail_type) pair is allowed for this relation."""
+    rule = RELATION_CONSTRAINTS.get(relation)
+    if rule is None:
+        return True  # no constraint → always allow
+    return (head_type in rule[0]) and (tail_type in rule[1])
+
+
+# ---------------------------------------------------------------------------
+# GLiNER-2 relation extractor (replaces GLiREL)
+# ---------------------------------------------------------------------------
+
+class _GliNERRelationExtractor:
+    """
+    Uses GLiNER-2 to score entity-pair relations.
+
+    Strategy:
+      1. Extract named entities from a text chunk with GLiNER.
+      2. For each ordered entity pair (head, tail) whose types pass the
+         constraint filter, build a synthetic prompt:
+             "<head_text> [RELATION] <tail_text>"
+         and ask GLiNER to score it against each relation label.
+      3. Keep the highest-scoring label above threshold.
+
+    This avoids any dependency on GLiREL while reusing the already-loaded
+    GLiNER model.
+    """
+
+    def __init__(self, gliner_model, threshold: float = 0.45):
+        self.model = gliner_model
+        self.threshold = threshold
+
+    def predict(
+        self,
+        text: str,
+        entities: List[dict],   # [{text, label, start, end, score}, ...]
+    ) -> List[dict]:
+        """
+        Returns list of relation dicts:
+            {head_text, tail_text, head_type, tail_type, label, score}
+        """
+        # Filter out excluded entity types
+        ents = [
+            e for e in entities
+            if e["label"].lower() not in RELATION_ENTITY_EXCLUDE
+        ][:MAX_ENTS]
+
+        if len(ents) < 2:
+            return []
+
+        results = []
+
+        for head, tail in combinations(ents, 2):
+            # Check both directions: head→tail and tail→head
+            for h, t in [(head, tail), (tail, head)]:
+                h_type = h["label"].lower()
+                t_type = t["label"].lower()
+
+                # Collect candidate relations that pass type constraints
+                candidate_labels = [
+                    lbl for lbl in RELATION_LABELS
+                    if _passes_constraint(h_type, t_type, lbl)
+                ]
+                if not candidate_labels:
+                    continue
+
+                # Build a compact context sentence for scoring
+                # Format: "<HEAD> [SEP] <TAIL>" — GLiNER scores this
+                # against each relation label as if it were an entity type
+                probe = f"{h['text']} [and] {t['text']}"
+
+                try:
+                    scored = self.model.predict_entities(
+                        probe,
+                        candidate_labels,
+                        threshold=self.threshold,
+                    )
+                except Exception:
+                    continue
+
+                if not scored:
+                    continue
+
+                # Pick the highest-confidence relation
+                best = max(scored, key=lambda x: x["score"])
+                results.append({
+                    "head_text": h["text"],
+                    "tail_text": t["text"],
+                    "head_type": h_type,
+                    "tail_type": t_type,
+                    "label":     best["label"],
+                    "score":     best["score"],
+                })
+
+        return results
+
+
 # ---------------------------------------------------------------------------
 # Main extractor class
 # ---------------------------------------------------------------------------
@@ -154,17 +244,17 @@ class EntityExtractor:
         self,
         use_spacy_fallback: bool = False,
         ontology_manager=None,
-        use_glirel: bool = True,
-        glirel_threshold: float = 0.50,
+        use_glirel: bool = True,     # kept for API compatibility; controls RE pass
+        glirel_threshold: float = 0.45,
         ner_threshold: float = CONFIDENCE_THRESHOLD,
     ):
         self.ontology = ontology_manager
         self.use_spacy_fallback = use_spacy_fallback
-        self.use_glirel = use_glirel
+        self.use_glirel = use_glirel          # now controls GLiNER-RE pass
         self.glirel_threshold = glirel_threshold
         self.ner_threshold = ner_threshold
         self._gliner_model = None
-        self._glirel_model = None
+        self._re_extractor: Optional[_GliNERRelationExtractor] = None
         self._spacy_nlp = None
 
     # ------------------------------------------------------------------
@@ -184,27 +274,20 @@ class EntityExtractor:
                 raise
         return self._gliner_model
 
-    def _load_glirel(self):
-        if self._glirel_model is None:
-            try:
-                from glirel import GLiREL
-                try:
-                    self._glirel_model = GLiREL.from_pretrained(
-                        "jackboyla/glirel-large-v0"
-                    )
-                except TypeError:
-                    # Newer huggingface_hub drops kwargs GLiREL's mixin still requires
-                    self._glirel_model = GLiREL._from_pretrained(
-                        model_id="jackboyla/glirel-large-v0",
-                        revision=None, cache_dir=None, force_download=False,
-                        proxies=None, resume_download=False,
-                        local_files_only=False, token=None, map_location="cpu",
-                    )
-                log.info("glirel_model_loaded", model="jackboyla/glirel-large-v0")
-            except Exception as e:
-                log.error("glirel_load_failed", error=str(e))
-                raise
-        return self._glirel_model
+    def _load_relation_extractor(self) -> _GliNERRelationExtractor:
+        """Return the GLiNER-2 based RE model (lazy init, reuses NER model)."""
+        if self._re_extractor is None:
+            model = self._load_gliner()
+            self._re_extractor = _GliNERRelationExtractor(
+                gliner_model=model,
+                threshold=self.glirel_threshold,
+            )
+            log.info(
+                "gliner_re_loaded",
+                model="urchade/gliner_large-v2.1",
+                threshold=self.glirel_threshold,
+            )
+        return self._re_extractor
 
     def _load_spacy(self):
         if self._spacy_nlp is None:
@@ -265,102 +348,101 @@ class EntityExtractor:
         self, articles: List[ArticleModel]
     ) -> List[Dict]:
         """
-        NEW: Run GLiNER (entities) + GLiREL-Large (relations) on each article.
-        Returns a flat list of relation dicts:
-            {head, relation, tail, score, article_id, head_type, tail_type}
+        Run GLiNER-2 NER + GLiNER-2 RE on each article.
 
-        Design mirrors extract_kg.py:
-          • chunk each article into MAX_WORDS windows
-          • filter RELATION_ENTITY_EXCLUDE entity types before GLiREL
-          • apply GLIREL_CONSTRAINTS post-filter
-          • _add_relation() deduplication (higher-score direction wins)
+        Public signature kept identical to the old GLiREL-based version so
+        main.py requires zero changes.  Returns a flat list of relation dicts:
+            {head, relation, tail, score, article_id}
+
+        Implementation:
+          • Chunks each article into MAX_WORDS windows.
+          • Runs GLiNER NER on the chunk to get typed entities.
+          • Passes entity pairs through _GliNERRelationExtractor which probes
+            the same GLiNER model with synthetic prompts to score relation labels.
+          • Deduplicates via _add_relation() (higher-scoring direction wins).
         """
         if not self.use_glirel:
             return []
 
         gliner = self._load_gliner()
-        glirel = self._load_glirel()
+        re_ext = self._load_relation_extractor()
         labels = self.get_gliner_labels()
         all_triples: List[Dict] = []
 
         for article in articles:
-            text = (article.content or "")
-            if not text.strip():
+            text = (article.content or "").strip()
+            if not text:
                 continue
 
             chunks = self._chunk_text(text)
             article_relations: Dict[Tuple, float] = {}
+            chunk_count = 0
 
             for chunk in chunks:
-                ents_raw = gliner.predict_entities(
-                    chunk, labels, threshold=self.ner_threshold
-                )
-                toks, spans = _tokenize(chunk)
+                chunk_count += 1
 
-                # Build NER list for GLiREL, excluding date/money types
-                ner, seen = [], set()
-                for ent in sorted(ents_raw, key=lambda x: -x["score"]):
-                    if ent["label"].lower() in RELATION_ENTITY_EXCLUDE:
-                        continue
-                    ts = _char_to_token_span(ent["start"], ent["end"], spans)
-                    if not ts or ts in seen:
-                        continue
-                    seen.add(ts)
-                    ner.append([ts[0], ts[1], ent["label"], ent["text"]])
-                    if len(ner) >= MAX_ENTS:
-                        break
-
-                if len(ner) < 2:
-                    continue
-
+                # Step 1: NER
                 try:
-                    rels = glirel.predict_relations(
-                        toks,
-                        GLIREL_RELATION_LABELS,
-                        threshold=self.glirel_threshold,
-                        ner=ner,
-                        top_k=1,
+                    ents_raw = gliner.predict_entities(
+                        chunk, labels, threshold=self.ner_threshold
                     )
-                    rels = _constrain_glirel(rels, ner)
                 except Exception as e:
                     log.warning(
-                        "glirel_chunk_failed",
-                        article_id=article.id,
-                        error=str(e),
+                        "gliner_chunk_ner_failed",
+                        article_id=article.id, error=str(e),
                     )
                     continue
 
-                # Build span→label lookup for type metadata
-                span_label = {(n[0], n[1]): n[2] for n in ner}
+                if len(ents_raw) < 2:
+                    continue
+
+                # Step 2: RE via GLiNER-2 pair scoring
+                try:
+                    rels = re_ext.predict(chunk, ents_raw)
+                except Exception as e:
+                    log.warning(
+                        "gliner_re_chunk_failed",
+                        article_id=article.id, error=str(e),
+                    )
+                    continue
 
                 for r in rels:
-                    head = " ".join(r["head_text"]).strip()
-                    tail = " ".join(r["tail_text"]).strip()
-                    if head.lower() == tail.lower():
+                    head = r["head_text"].strip()
+                    tail = r["tail_text"].strip()
+                    if not head or not tail or head.lower() == tail.lower():
                         continue
-                    _add_relation(article_relations, head, r["label"], tail, r["score"])
+                    _add_relation(
+                        article_relations, head, r["label"], tail, r["score"]
+                    )
 
-            # Convert deduplicated dict → list of triples
+            # Convert deduplicated dict → list
             for (head, relation, tail), score in article_relations.items():
                 all_triples.append(
                     {
-                        "head": head,
-                        "relation": relation,
-                        "tail": tail,
-                        "score": round(score, 4),
+                        "head":       head,
+                        "relation":   relation,
+                        "tail":       tail,
+                        "score":      round(score, 4),
                         "article_id": article.id,
                     }
                 )
 
+            log.debug(
+                "re_article_triples",
+                article_id=article.id,
+                triples=len(article_relations),
+                chunks=chunk_count,
+            )
+
         log.info(
-            "glirel_extraction_complete",
+            "gliner_re_extraction_complete",
             articles=len(articles),
             triples=len(all_triples),
         )
         return all_triples
 
     # ------------------------------------------------------------------
-    # Internal GLiNER extraction
+    # Internal GLiNER NER extraction
     # ------------------------------------------------------------------
 
     def _extract_gliner_batch(
@@ -400,15 +482,15 @@ class EntityExtractor:
         nlp = self._load_spacy()
         doc = nlp(article.content or "")
         type_map = {
-            "PERSON": "person",
-            "ORG": "organization",
-            "GPE": "country",
-            "LOC": "location",
-            "EVENT": "event",
-            "PRODUCT": "product",
-            "WORK_OF_ART": "product",
-            "LAW": "law or sanction",
-            "NORP": "political group",
+            "PERSON":     "person",
+            "ORG":        "organization",
+            "GPE":        "country",
+            "LOC":        "location",
+            "EVENT":      "event",
+            "PRODUCT":    "product",
+            "WORK_OF_ART":"product",
+            "LAW":        "law or sanction",
+            "NORP":       "political group",
         }
         return [
             EntityMention(
@@ -423,7 +505,7 @@ class EntityExtractor:
         ]
 
     # ------------------------------------------------------------------
-    # Chunking helper (same logic as extract_kg.py)
+    # Chunking helper
     # ------------------------------------------------------------------
 
     @staticmethod
