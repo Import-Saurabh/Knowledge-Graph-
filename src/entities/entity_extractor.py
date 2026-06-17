@@ -27,12 +27,16 @@ _add_relation dedup) is unchanged.
 import re
 import uuid
 from itertools import combinations
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 
+import torch
 from src.models.article import ArticleModel
 from src.models.entity import EntityMention
 from src.utils.config import settings
 from src.utils.logger import get_logger
+
+# Set CPU threads for optimal performance
+torch.set_num_threads(8)  # adjust based on your CPU cores
 
 log = get_logger(__name__)
 
@@ -43,22 +47,21 @@ CONFIDENCE_THRESHOLD = 0.4
 # GLiNER-2 RE configuration
 # ---------------------------------------------------------------------------
 
-MAX_ENTS  = 40    # cap entities per chunk
-MAX_WORDS = 200   # words per chunk
-
+MAX_ENTS = 40          # cap entities per chunk
+MAX_WORDS = 400        # increased from 200 to reduce chunk count
 RELATION_ENTITY_EXCLUDE = {"date", "money or economic value"}
 
 TOKEN_RE = re.compile(r"\w+(?:[-_]\w+)*|\S")
 
 # Logical actor / location / thing groups used in CONSTRAINTS
-_PER    = {"person"}
-_ROLE   = {"job title or role"}
+_PER = {"person"}
+_ROLE = {"job title or role"}
 _NATION = {"country", "geopolitical entity"}
-_ORG    = {"organization", "government agency", "military unit", "political group"}
-_PLACE  = {"country", "city", "location", "geopolitical entity", "facility"}
-_ARMS   = {"weapon", "military operation", "vehicle or aircraft"}
-_EVENT  = {"event", "military operation"}
-_ACTOR  = _PER | _ORG | _NATION
+_ORG = {"organization", "government agency", "military unit", "political group"}
+_PLACE = {"country", "city", "location", "geopolitical entity", "facility"}
+_ARMS = {"weapon", "military operation", "vehicle or aircraft"}
+_EVENT = {"event", "military operation"}
+_ACTOR = _PER | _ORG | _NATION
 _HITTABLE = _PLACE | _ORG | _PER | _ARMS
 
 # Relation labels we want to detect — same list as before
@@ -142,12 +145,12 @@ def _passes_constraint(head_type: str, tail_type: str, relation: str) -> bool:
     """Return True if the (head_type, tail_type) pair is allowed for this relation."""
     rule = RELATION_CONSTRAINTS.get(relation)
     if rule is None:
-        return True  # no constraint → always allow
+        return True
     return (head_type in rule[0]) and (tail_type in rule[1])
 
 
 # ---------------------------------------------------------------------------
-# GLiNER-2 relation extractor (replaces GLiREL)
+# GLiNER-2 relation extractor (replaces GLiREL) — now with batched scoring
 # ---------------------------------------------------------------------------
 
 class _GliNERRelationExtractor:
@@ -163,75 +166,67 @@ class _GliNERRelationExtractor:
       3. Keep the highest-scoring label above threshold.
 
     This avoids any dependency on GLiREL while reusing the already-loaded
-    GLiNER model.
+    GLiNER model.  Scoring is batched across many pairs for efficiency.
     """
 
     def __init__(self, gliner_model, threshold: float = 0.45):
         self.model = gliner_model
         self.threshold = threshold
 
-    def predict(
+    def score_pairs_batch(
         self,
-        text: str,
-        entities: List[dict],   # [{text, label, start, end, score}, ...]
-    ) -> List[dict]:
+        pairs: List[Tuple[str, str, str, str]],  # (head_text, tail_text, head_type, tail_type)
+        batch_size: int = 256,
+    ) -> List[Optional[Dict[str, Any]]]:
         """
-        Returns list of relation dicts:
-            {head_text, tail_text, head_type, tail_type, label, score}
-        """
-        # Filter out excluded entity types
-        ents = [
-            e for e in entities
-            if e["label"].lower() not in RELATION_ENTITY_EXCLUDE
-        ][:MAX_ENTS]
+        Score a list of entity pairs against all relation labels in one batched GLiNER call.
 
-        if len(ents) < 2:
+        Returns a list of dicts (or None) with keys:
+            head_text, tail_text, head_type, tail_type, label, score
+        """
+        if not pairs:
             return []
 
-        results = []
+        results = [None] * len(pairs)
+        # Batch to avoid OOM
+        for start in range(0, len(pairs), batch_size):
+            batch = pairs[start:start+batch_size]
+            probes = [f"{h} [and] {t}" for h, t, _, _ in batch]
+            try:
+                # GLiNER can accept a list of texts and returns a list of predictions
+                all_scores = self.model.predict_entities(
+                    probes,
+                    RELATION_LABELS,
+                    threshold=0.0,  # we'll apply threshold later
+                )
+            except Exception as e:
+                log.warning("gliner_batch_re_failed", error=str(e))
+                continue
 
-        for head, tail in combinations(ents, 2):
-            # Check both directions: head→tail and tail→head
-            for h, t in [(head, tail), (tail, head)]:
-                h_type = h["label"].lower()
-                t_type = t["label"].lower()
-
-                # Collect candidate relations that pass type constraints
-                candidate_labels = [
+            for idx_in_batch, (probe, scores_for_probe, pair) in enumerate(
+                zip(probes, all_scores, batch)
+            ):
+                h, t, htype, ttype = pair
+                # Find allowed relations
+                allowed = [
                     lbl for lbl in RELATION_LABELS
-                    if _passes_constraint(h_type, t_type, lbl)
+                    if _passes_constraint(htype, ttype, lbl)
                 ]
-                if not candidate_labels:
-                    continue
-
-                # Build a compact context sentence for scoring
-                # Format: "<HEAD> [SEP] <TAIL>" — GLiNER scores this
-                # against each relation label as if it were an entity type
-                probe = f"{h['text']} [and] {t['text']}"
-
-                try:
-                    scored = self.model.predict_entities(
-                        probe,
-                        candidate_labels,
-                        threshold=self.threshold,
-                    )
-                except Exception:
-                    continue
-
-                if not scored:
-                    continue
-
-                # Pick the highest-confidence relation
-                best = max(scored, key=lambda x: x["score"])
-                results.append({
-                    "head_text": h["text"],
-                    "tail_text": t["text"],
-                    "head_type": h_type,
-                    "tail_type": t_type,
-                    "label":     best["label"],
-                    "score":     best["score"],
-                })
-
+                best_label = None
+                best_score = self.threshold
+                for item in scores_for_probe:
+                    if item["label"] in allowed and item["score"] > best_score:
+                        best_score = item["score"]
+                        best_label = item["label"]
+                if best_label is not None:
+                    results[start + idx_in_batch] = {
+                        "head_text": h,
+                        "tail_text": t,
+                        "head_type": htype,
+                        "tail_type": ttype,
+                        "label": best_label,
+                        "score": best_score,
+                    }
         return results
 
 
@@ -244,13 +239,13 @@ class EntityExtractor:
         self,
         use_spacy_fallback: bool = False,
         ontology_manager=None,
-        use_glirel: bool = True,     # kept for API compatibility; controls RE pass
+        use_glirel: bool = True,
         glirel_threshold: float = 0.45,
         ner_threshold: float = CONFIDENCE_THRESHOLD,
     ):
         self.ontology = ontology_manager
         self.use_spacy_fallback = use_spacy_fallback
-        self.use_glirel = use_glirel          # now controls GLiNER-RE pass
+        self.use_glirel = use_glirel
         self.glirel_threshold = glirel_threshold
         self.ner_threshold = ner_threshold
         self._gliner_model = None
@@ -275,7 +270,6 @@ class EntityExtractor:
         return self._gliner_model
 
     def _load_relation_extractor(self) -> _GliNERRelationExtractor:
-        """Return the GLiNER-2 based RE model (lazy init, reuses NER model)."""
         if self._re_extractor is None:
             model = self._load_gliner()
             self._re_extractor = _GliNERRelationExtractor(
@@ -348,7 +342,7 @@ class EntityExtractor:
         self, articles: List[ArticleModel]
     ) -> List[Dict]:
         """
-        Run GLiNER-2 NER + GLiNER-2 RE on each article.
+        Run GLiNER-2 NER + batched GLiNER-2 RE on all articles.
 
         Public signature kept identical to the old GLiREL-based version so
         main.py requires zero changes.  Returns a flat list of relation dicts:
@@ -356,9 +350,9 @@ class EntityExtractor:
 
         Implementation:
           • Chunks each article into MAX_WORDS windows.
-          • Runs GLiNER NER on the chunk to get typed entities.
-          • Passes entity pairs through _GliNERRelationExtractor which probes
-            the same GLiNER model with synthetic prompts to score relation labels.
+          • Runs GLiNER NER on all chunks in one batched call.
+          • For each article, collects all entity pairs that pass type constraints.
+          • Scores all those pairs in a single batched RE call per article.
           • Deduplicates via _add_relation() (higher-scoring direction wins).
         """
         if not self.use_glirel:
@@ -369,69 +363,129 @@ class EntityExtractor:
         labels = self.get_gliner_labels()
         all_triples: List[Dict] = []
 
+        # Step 1: Build all chunks and their article mapping
+        chunk_to_article = []          # list of (article_id, chunk_text)
+        article_chunks = {a.id: [] for a in articles}
         for article in articles:
             text = (article.content or "").strip()
             if not text:
                 continue
-
             chunks = self._chunk_text(text)
-            article_relations: Dict[Tuple, float] = {}
-            chunk_count = 0
-
             for chunk in chunks:
-                chunk_count += 1
+                article_chunks[article.id].append(chunk)
+                chunk_to_article.append((article.id, chunk))
 
-                # Step 1: NER
-                try:
-                    ents_raw = gliner.predict_entities(
-                        chunk, labels, threshold=self.ner_threshold
-                    )
-                except Exception as e:
-                    log.warning(
-                        "gliner_chunk_ner_failed",
-                        article_id=article.id, error=str(e),
-                    )
+        if not chunk_to_article:
+            return []
+
+        # Step 2: Batch NER on all chunks
+        chunk_texts = [chunk for _, chunk in chunk_to_article]
+        try:
+            all_ents_raw = gliner.predict_entities(
+                chunk_texts, labels, threshold=self.ner_threshold
+            )
+        except Exception as e:
+            log.error("gliner_batch_ner_failed", error=str(e))
+            return []
+
+        # Step 3: For each article, gather entity pairs and score them in batch
+        for article in articles:
+            article_relations: Dict[Tuple, float] = {}
+            # Get chunks and their NER results for this article
+            article_chunks_texts = article_chunks.get(article.id, [])
+            if not article_chunks_texts:
+                continue
+
+            # Find indices of chunks belonging to this article
+            start_idx = 0
+            article_ents = []
+            for chunk_text in article_chunks_texts:
+                # Find the chunk in chunk_to_article (order preserved)
+                # Since we built chunk_to_article in same order, we can maintain a pointer
+                # but simpler: use a dict mapping chunk text to its raw entities
+                # However, chunk texts might not be unique. Better to use the list index.
+                # We'll iterate over chunk_to_article and collect matching article_id.
+                # But for performance, we can pre-build a map from article_id to list of chunk indices.
+                pass
+
+            # More efficient: build a map from article_id to list of (chunk_text, ents_raw)
+            # We'll do that in a single pass after NER.
+
+        # Let's refactor: after NER, we have a list of ents_raw per chunk.
+        # We can group by article_id.
+
+        # Rebuild mapping: article_id -> list of (chunk_text, entities)
+        article_chunk_ents = {a.id: [] for a in articles}
+        for (article_id, chunk_text), ents in zip(chunk_to_article, all_ents_raw):
+            if ents:
+                article_chunk_ents[article_id].append((chunk_text, ents))
+
+        # Now process each article's chunks
+        for article in articles:
+            article_relations: Dict[Tuple, float] = {}
+            chunk_data = article_chunk_ents.get(article.id, [])
+            if not chunk_data:
+                continue
+
+            # Collect all pairs across chunks for this article
+            all_pairs = []  # (head_text, tail_text, head_type, tail_type)
+            for chunk_text, ents_raw in chunk_data:
+                # Filter out excluded types and limit entities
+                ents = [
+                    e for e in ents_raw
+                    if e["label"].lower() not in RELATION_ENTITY_EXCLUDE
+                ][:MAX_ENTS]
+                if len(ents) < 2:
                     continue
 
-                if len(ents_raw) < 2:
-                    continue
+                # Generate all ordered pairs that pass type constraints for at least one relation
+                for head, tail in combinations(ents, 2):
+                    for h, t in [(head, tail), (tail, head)]:
+                        htype = h["label"].lower()
+                        ttype = t["label"].lower()
+                        # Check if there's any allowed relation
+                        has_allowed = any(
+                            _passes_constraint(htype, ttype, lbl)
+                            for lbl in RELATION_LABELS
+                        )
+                        if has_allowed:
+                            all_pairs.append((h["text"], t["text"], htype, ttype))
 
-                # Step 2: RE via GLiNER-2 pair scoring
-                try:
-                    rels = re_ext.predict(chunk, ents_raw)
-                except Exception as e:
-                    log.warning(
-                        "gliner_re_chunk_failed",
-                        article_id=article.id, error=str(e),
-                    )
-                    continue
+            if not all_pairs:
+                continue
 
-                for r in rels:
-                    head = r["head_text"].strip()
-                    tail = r["tail_text"].strip()
-                    if not head or not tail or head.lower() == tail.lower():
-                        continue
-                    _add_relation(
-                        article_relations, head, r["label"], tail, r["score"]
-                    )
+            # Step 4: Batch score all pairs for this article
+            scored = re_ext.score_pairs_batch(all_pairs)
+            for pair_score in scored:
+                if pair_score is None:
+                    continue
+                head = pair_score["head_text"].strip()
+                tail = pair_score["tail_text"].strip()
+                if not head or not tail or head.lower() == tail.lower():
+                    continue
+                _add_relation(
+                    article_relations,
+                    head,
+                    pair_score["label"],
+                    tail,
+                    pair_score["score"],
+                )
 
             # Convert deduplicated dict → list
             for (head, relation, tail), score in article_relations.items():
-                all_triples.append(
-                    {
-                        "head":       head,
-                        "relation":   relation,
-                        "tail":       tail,
-                        "score":      round(score, 4),
-                        "article_id": article.id,
-                    }
-                )
+                all_triples.append({
+                    "head": head,
+                    "relation": relation,
+                    "tail": tail,
+                    "score": round(score, 4),
+                    "article_id": article.id,
+                })
 
             log.debug(
                 "re_article_triples",
                 article_id=article.id,
                 triples=len(article_relations),
-                chunks=chunk_count,
+                chunks=len(chunk_data),
             )
 
         log.info(
@@ -442,7 +496,7 @@ class EntityExtractor:
         return all_triples
 
     # ------------------------------------------------------------------
-    # Internal GLiNER NER extraction
+    # Internal GLiNER NER extraction (unchanged but used for batch)
     # ------------------------------------------------------------------
 
     def _extract_gliner_batch(

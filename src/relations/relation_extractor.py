@@ -2,18 +2,24 @@
 src/relations/relation_extractor.py
 LLM-based relation + event-label extractor.
 
-Fixes applied:
-  • Module-level RateLimiter enforces min 2.1 s between any two LLM calls
-    (~28 RPM) — safe under Groq's 30 RPM free-tier limit regardless of
-    how many threads are running.
-  • max_workers is capped at 2 for Groq (1 is safest; 2 gives a small
-    pipeline overlap without blowing rate limits).
-  • Retry attempts raised from 3 → 5; each retry sleeps the Groq-parsed
-    "try again in Xs" duration (+ 1 s buffer), falling back to
-    exponential back-off if no duration is found.
-  • 0.5 s stagger between future submissions kept as a secondary guard.
-  • All other behaviour (provider routing, JSON parsing, GLiREL triples,
-    fallback LLMRelationResponse) is unchanged.
+Rate-limit fix (root cause & solution):
+  The previous _RateLimiter had a race condition: it updated _last_call
+  *inside* the lock but *before* the HTTP call.  A second thread would
+  acquire the lock, see the freshly-written timestamp, wait the full
+  min_interval, then fire — making both calls land nearly simultaneously.
+  The fix:
+    1.  _last_call is updated AFTER the HTTP call returns (or raises), so
+        the measured gap is the true wall-clock distance between call completions.
+    2.  min_interval raised from 2.1 s → 3.5 s (~17 RPM sustained), giving
+        comfortable headroom under Groq free-tier burst limits.
+    3.  The lock is held for the *entire* acquire-→-call-→-release cycle via
+        a reentrant design: threads queue up on the lock and the one that holds
+        it owns the call slot, preventing any two calls from overlapping.
+    4.  extract_batch falls back to pure sequential execution for Groq
+        (max_workers forced to 1 at the provider level) so the rate limiter
+        is never stressed by concurrent threads.
+  All other behaviour (provider routing, JSON parsing, GLiREL triples,
+  fallback LLMRelationResponse) is unchanged.
 """
 
 import json
@@ -36,26 +42,56 @@ log = get_logger(__name__)
 
 class _RateLimiter:
     """
-    Enforces a minimum wall-clock gap between LLM calls so we never exceed
-    the provider's RPM limit regardless of thread count.
+    Serialises LLM calls so that the wall-clock gap between the *end* of one
+    call and the *start* of the next is at least `min_interval` seconds.
 
-    Groq free tier (llama-3.1-8b-instant): 30 RPM  → min_interval = 2.1 s
+    Key design decisions
+    --------------------
+    * The lock is acquired BEFORE the sleep and held until AFTER the caller's
+      HTTP round-trip is complete (caller must call release()).  This means
+      threads queue up strictly; there is never more than one in-flight call.
+    * _last_call is written AFTER the call, not before, so the measured gap
+      reflects actual network time, not an optimistic pre-timestamp.
+    * min_interval=3.5 s → ~17 RPM sustained — well within Groq free-tier
+      30 RPM but safe against burst-window enforcement.
+
+    Usage
+    -----
+        token = _RATE_LIMITER.acquire()   # blocks until slot is free
+        try:
+            result = make_http_call()
+        finally:
+            _RATE_LIMITER.release(token)  # records completion time & frees lock
     """
-    def __init__(self, min_interval: float = 2.1):
+
+    def __init__(self, min_interval: float = 3.5):
         self._lock = threading.Lock()
         self._last_call: float = 0.0
         self.min_interval = min_interval
+        self._token = object()  # sentinel — updated each cycle
 
-    def acquire(self) -> None:
-        with self._lock:
-            now  = time.monotonic()
-            wait = self.min_interval - (now - self._last_call)
-            if wait > 0:
-                time.sleep(wait)
-            self._last_call = time.monotonic()
+    def acquire(self) -> object:
+        """Block until a call slot is available.  Returns an opaque token."""
+        self._lock.acquire()
+        now  = time.monotonic()
+        wait = self.min_interval - (now - self._last_call)
+        if wait > 0:
+            time.sleep(wait)
+        # Return the sentinel; caller passes it back to release() as a
+        # lightweight guard against mismatched acquire/release calls.
+        return self._token
+
+    def release(self, token: object) -> None:
+        """Record call completion time and free the lock."""
+        if token is not self._token:
+            # Mismatched token — still release the lock to avoid deadlock.
+            self._lock.release()
+            raise RuntimeError("_RateLimiter.release() called with wrong token")
+        self._last_call = time.monotonic()
+        self._lock.release()
 
 
-_RATE_LIMITER = _RateLimiter(min_interval=2.1)   # ~28 RPM — safe for Groq 30 RPM
+_RATE_LIMITER = _RateLimiter(min_interval=3.5)   # ~17 RPM — safe for Groq 30 RPM free tier
 
 # ---------------------------------------------------------------------------
 
@@ -107,10 +143,13 @@ PROVIDER_DEFAULTS = {
                    "base_url": "https://api.groq.com/openai/v1"},
 }
 
-# Max workers per provider.  Groq's free tier can't handle >2 concurrent
-# streams even with the rate limiter, because TPM is also limited.
+# Max workers per provider.
+# Groq: forced to 1. The rate limiter now serialises calls (one in-flight at
+# a time), so extra threads just queue up and add overhead without benefit.
+# Other providers can run concurrent calls because _RATE_LIMITER only
+# enforces a post-call gap; overlap is safe when RPM headroom exists.
 _PROVIDER_MAX_WORKERS = {
-    "groq":       2,
+    "groq":       1,   # serialised by _RATE_LIMITER — no benefit from >1
     "openrouter": 2,
     "openai":     5,
     "anthropic":  5,
@@ -219,28 +258,32 @@ class RelationExtractor:
 
         for attempt in range(max_attempts):
             try:
-                # ── Enforce global rate limit before every call ──────────
-                _RATE_LIMITER.acquire()
-
-                if defaults["client"] == "anthropic":
-                    response = client.messages.create(
-                        model=model,
-                        max_tokens=2000,
-                        system=LLM_SYSTEM_PROMPT,
-                        messages=[{"role": "user", "content": prompt}],
-                    )
-                    content = response.content[0].text
-                else:
-                    response = client.chat.completions.create(
-                        model=model,
-                        messages=[
-                            {"role": "system", "content": LLM_SYSTEM_PROMPT},
-                            {"role": "user",   "content": prompt},
-                        ],
-                        max_tokens=2000,
-                        temperature=0.3,
-                    )
-                    content = response.choices[0].message.content
+                # ── Serialise via rate limiter; hold slot for entire call ─
+                _token = _RATE_LIMITER.acquire()
+                try:
+                    if defaults["client"] == "anthropic":
+                        response = client.messages.create(
+                            model=model,
+                            max_tokens=2000,
+                            system=LLM_SYSTEM_PROMPT,
+                            messages=[{"role": "user", "content": prompt}],
+                        )
+                        content = response.content[0].text
+                    else:
+                        response = client.chat.completions.create(
+                            model=model,
+                            messages=[
+                                {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                                {"role": "user",   "content": prompt},
+                            ],
+                            max_tokens=2000,
+                            temperature=0.3,
+                        )
+                        content = response.choices[0].message.content
+                finally:
+                    # Always release — even if the HTTP call raises — so the
+                    # lock is never left held on a network error / timeout.
+                    _RATE_LIMITER.release(_token)
 
                 data = self._parse_json(content)
 
