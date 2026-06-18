@@ -5,8 +5,12 @@ Wraps sentence-transformers (BAAI/bge-small-en-v1.5 by default).
 No bug-list items target this file. Minor additions:
   • `embed_articles` now guards against None content (mirrors bug #6 style).
   • Model load is lazy and cached; dimension is inferred from model name.
+  • _load_model suppresses the benign BERT 'embeddings.position_ids UNEXPECTED'
+    buffer warning that fires on every cold load of bge-small/large-en-v1.5.
 """
 
+import logging
+import warnings
 from typing import List, Tuple
 from src.utils.config import settings
 from src.utils.logger import get_logger
@@ -34,15 +38,47 @@ class EmbeddingGenerator:
     # ------------------------------------------------------------------
 
     def _load_model(self):
-        if self._model is None:
-            try:
-                from sentence_transformers import SentenceTransformer
+        if self._model is not None:
+            return self._model
+
+        # Suppress the harmless 'embeddings.position_ids UNEXPECTED' warning.
+        # Root cause: newer BERT checkpoints register position_ids as a
+        # persistent *buffer* (not a parameter); the sentence-transformers
+        # loader only expects parameters, so it flags every buffer as
+        # UNEXPECTED.  No weights are wrong — the buffer is rebuilt correctly
+        # at runtime.  We mute the two loggers that print the load-report
+        # table and restore them immediately after the model is ready.
+        st_logger = logging.getLogger("sentence_transformers")
+        hf_logger = logging.getLogger("transformers.modeling_utils")
+        old_st    = st_logger.level
+        old_hf    = hf_logger.level
+        st_logger.setLevel(logging.ERROR)
+        hf_logger.setLevel(logging.ERROR)
+
+        try:
+            from sentence_transformers import SentenceTransformer
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r".*position_ids.*",
+                    category=UserWarning,
+                )
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r".*UNEXPECTED.*",
+                    category=UserWarning,
+                )
                 self._model = SentenceTransformer(self.model_name)
-                log.info("embedding_model_loaded", model=self.model_name,
-                         dimension=self._dimension)
-            except Exception as e:
-                log.error("failed_to_load_embedding_model", error=str(e))
-                raise
+            log.info("embedding_model_loaded", model=self.model_name,
+                     dimension=self._dimension)
+        except Exception as e:
+            log.error("failed_to_load_embedding_model", error=str(e))
+            raise
+        finally:
+            # Always restore — even if load fails
+            st_logger.setLevel(old_st)
+            hf_logger.setLevel(old_hf)
+
         return self._model
 
     # ------------------------------------------------------------------

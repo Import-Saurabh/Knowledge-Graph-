@@ -1,24 +1,8 @@
 """
 src/graph/neo4j_exporter.py
 
-Exports the NetworkX DiGraph to:
-  • nodes.csv          — neo4j-admin import ready (+ community_id column)
-  • relationships.csv  — includes `source` (llm/glirel) and `article_id`
-  • graph.html         — PyVis interactive visualisation
-
-Changes vs previous version:
-  - Node colour now driven by `community_id` (assigned by GraphBuilder's
-    Louvain pass) so clusters stand out visually.  Event nodes stay orange.
-  - Edge width and opacity are confidence-scaled:
-      width  = 1.5 + confidence * 4.0   (range ≈ 2 – 5.5 px)
-  - Low-confidence edges (< EDGE_OPACITY_THRESHOLD) rendered semi-transparent
-    to reduce clutter without removing them from the export.
-  - GLiREL edges still dashed-blue; LLM edges solid dark-gray.
-  - PARTICIPATES_IN edges remain thin dashed-gray (structural, not semantic).
-  - Physics preset tightened to reduce spaghetti on large graphs.
-  - export_pyvis_html() accepts an optional `top_n_nodes` param:
-    when set, only the top-N nodes by degree are rendered in the HTML
-    (CSV exports always contain the full graph).
+Exports the NetworkX DiGraph to nodes.csv, relationships.csv, and graph.html.
+Includes Wikidata fields and infobox source.
 """
 
 import csv
@@ -29,12 +13,6 @@ from src.utils.logger import get_logger
 
 log = get_logger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Colour helpers
-# ---------------------------------------------------------------------------
-
-# Palette for up to 20 communities.  Additional communities wrap around.
 _COMMUNITY_PALETTE = [
     "#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f",
     "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac",
@@ -42,56 +20,32 @@ _COMMUNITY_PALETTE = [
     "#d62728", "#ff9896", "#9467bd", "#c5b0d5", "#8c564b",
 ]
 
-
 def _community_color(community_id: int | None) -> str:
     if community_id is None:
         return "#9ca3af"
     return _COMMUNITY_PALETTE[int(community_id) % len(_COMMUNITY_PALETTE)]
 
-
-def _type_color(type_name: str) -> str:
-    """Deterministic hex color from a type string (MD5 hash) — used as fallback."""
-    h = hashlib.md5(type_name.encode()).hexdigest()
-    r = max(60, min(int(h[0:2], 16), 210))
-    g = max(60, min(int(h[2:4], 16), 210))
-    b = max(60, min(int(h[4:6], 16), 210))
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-
 def _edge_width(confidence: float) -> float:
-    """Map [0, 1] confidence → [1.5, 5.5] edge width."""
     return 1.5 + float(confidence) * 4.0
 
-
 def _edge_opacity(confidence: float, threshold: float = 0.60) -> str:
-    """
-    Return rgba opacity string.  Edges below threshold are semi-transparent
-    (0.35) so high-confidence edges dominate visually.
-    """
     return "1.0" if float(confidence) >= threshold else "0.35"
 
-
 class Neo4jExporter:
-    EDGE_OPACITY_THRESHOLD: float = 0.60  # edges below this are faded
-
-    # ------------------------------------------------------------------
-    # CSV export  (always full graph — no pruning here)
-    # ------------------------------------------------------------------
+    EDGE_OPACITY_THRESHOLD: float = 0.60
 
     def export_nodes_csv(self, graph: nx.DiGraph, output_path: str) -> None:
-        """
-        Columns: id, name, type, mention_count, cluster_id,
-                 temporal_window, community_id
-        Compatible with neo4j-admin database import full --nodes=...
-        """
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
                 "id:ID", "name", "type:LABEL",
                 "mention_count:INT", "cluster_id",
                 "temporal_window", "community_id:INT",
+                "wikidata_id", "description", "types", "url",
             ])
             for node, data in graph.nodes(data=True):
+                types_list = data.get("types", [])
+                types_str = ";".join(types_list) if types_list else ""
                 writer.writerow([
                     node,
                     data.get("name", ""),
@@ -100,20 +54,20 @@ class Neo4jExporter:
                     data.get("cluster_id", ""),
                     data.get("temporal_window", ""),
                     data.get("community_id", -1),
+                    data.get("wikidata_id", ""),
+                    data.get("description", ""),
+                    types_str,
+                    data.get("url", ""),
                 ])
         log.info("nodes_exported", path=output_path, count=graph.number_of_nodes())
 
     def export_relationships_csv(self, graph: nx.DiGraph, output_path: str) -> None:
-        """
-        Columns: source, target, relation, confidence, event_id,
-                 article_id, edge_source
-        Compatible with neo4j-admin database import full --relationships=...
-        """
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
                 ":START_ID", ":END_ID", ":TYPE",
                 "confidence:FLOAT", "event_id", "article_id", "edge_source",
+                "wikidata_property", "wikidata_date", "needs_review:BOOLEAN",
             ])
             for u, v, data in graph.edges(data=True):
                 writer.writerow([
@@ -124,80 +78,63 @@ class Neo4jExporter:
                     data.get("event_id", ""),
                     data.get("article_id", ""),
                     data.get("source", "unknown"),
+                    data.get("wikidata_property", ""),
+                    data.get("wikidata_date", ""),
+                    data.get("needs_review", False),
                 ])
         log.info("relationships_exported", path=output_path,
                  count=graph.number_of_edges())
 
-    # ------------------------------------------------------------------
-    # PyVis HTML
-    # ------------------------------------------------------------------
-
-    def export_pyvis_html(
-        self,
-        graph: nx.DiGraph,
-        output_path: str,
-        top_n_nodes: int | None = None,
-    ) -> None:
-        """
-        Render an interactive PyVis graph.
-
-        Parameters
-        ----------
-        graph        : the full NetworkX DiGraph from GraphBuilder
-        output_path  : where to write graph.html
-        top_n_nodes  : if set, only the top-N nodes by degree are included
-                       in the HTML visualisation (CSV exports are unaffected).
-                       Useful for keeping large graphs readable; recommended
-                       value: 150–300.
-        """
+    def export_pyvis_html(self, graph: nx.DiGraph, output_path: str,
+                          top_n_nodes: int | None = None) -> None:
         try:
             from pyvis.network import Network
         except ImportError:
             log.error("pyvis_not_installed", hint="pip install pyvis")
             return
 
-        # ── Optionally restrict to top-N nodes by degree ────────────────
         render_graph = graph
         if top_n_nodes is not None and graph.number_of_nodes() > top_n_nodes:
             top_nodes = sorted(
                 graph.nodes(), key=lambda n: graph.degree(n), reverse=True
             )[:top_n_nodes]
             render_graph = graph.subgraph(top_nodes).copy()
-            log.info(
-                "html_export_subgraph",
-                total_nodes=graph.number_of_nodes(),
-                rendered_nodes=render_graph.number_of_nodes(),
-                rendered_edges=render_graph.number_of_edges(),
-            )
+            log.info("html_export_subgraph",
+                     total_nodes=graph.number_of_nodes(),
+                     rendered_nodes=render_graph.number_of_nodes(),
+                     rendered_edges=render_graph.number_of_edges())
 
-        net = Network(
-            height="950px", width="100%",
-            directed=True,
-            bgcolor="#f8fafc",      # very light gray — easier on the eyes than white
-            font_color="#1f2937",
-        )
+        net = Network(height="950px", width="100%",
+                      directed=True, bgcolor="#f8fafc", font_color="#1f2937")
 
-        # ── Nodes ────────────────────────────────────────────────────────
         for node, data in render_graph.nodes(data=True):
-            node_type   = data.get("type", "Unknown")
-            community   = data.get("community_id", None)
-            mentions    = data.get("mention_count", 0)
-
-            # Event nodes stay vivid orange; others coloured by community
+            node_type = data.get("type", "Unknown")
+            community = data.get("community_id", None)
+            mentions = data.get("mention_count", 0)
             if node_type == "Event":
                 color = "#f97316"
-                size  = 22
+                size = 22
             else:
                 color = _community_color(community)
-                size  = max(12, 10 + mentions * 1.6)
+                size = max(12, 10 + mentions * 1.6)
 
             aliases_str = ", ".join(data.get("aliases") or [])
-            tooltip = (
-                f"Type: {node_type}\n"
-                f"Community: {community if community is not None else '—'}\n"
-                f"Mentions: {mentions}\n"
-                f"Aliases: {aliases_str or '—'}"
-            )
+            tooltip_lines = [
+                f"Type: {node_type}",
+                f"Community: {community if community is not None else '—'}",
+                f"Mentions: {mentions}",
+                f"Aliases: {aliases_str or '—'}",
+            ]
+            if data.get("wikidata_id"):
+                tooltip_lines.append(f"Wikidata: {data['wikidata_id']}")
+            if data.get("description"):
+                tooltip_lines.append(f"Description: {data['description']}")
+            if data.get("types"):
+                tooltip_lines.append(f"Types: {', '.join(data['types'])}")
+            if data.get("url"):
+                tooltip_lines.append(f"URL: {data['url']}")
+            tooltip = "\n".join(tooltip_lines)
+
             net.add_node(
                 node,
                 label=str(data.get("name", node))[:50],
@@ -206,7 +143,7 @@ class Neo4jExporter:
                     "background": color,
                     "border": "#111827",
                     "highlight": {"background": color, "border": "#000000"},
-                    "hover":     {"background": color, "border": "#000000"},
+                    "hover": {"background": color, "border": "#000000"},
                 },
                 borderWidth=2,
                 borderWidthSelected=4,
@@ -216,38 +153,43 @@ class Neo4jExporter:
                 group=community if community is not None else -1,
             )
 
-        # ── Edges (confidence-scaled width + opacity) ────────────────────
         for u, v, data in render_graph.edges(data=True):
-            rel        = data.get("relation", "")
-            src        = data.get("source", "unknown")
+            rel = data.get("relation", "")
+            src = data.get("source", "unknown")
             confidence = float(data.get("confidence", data.get("glirel_score", 0.0)))
-            width      = _edge_width(confidence)
-            opacity    = _edge_opacity(confidence, self.EDGE_OPACITY_THRESHOLD)
+            width = _edge_width(confidence)
+            opacity = _edge_opacity(confidence, self.EDGE_OPACITY_THRESHOLD)
 
             if rel == "PARTICIPATES_IN":
                 hex_color = "#6b7280"
-                dashes    = True
-                width     = 1.5
+                dashes = True
+                width = 1.5
             elif src == "glirel":
-                hex_color = "#2563eb"   # strong blue for GLiREL
-                dashes    = True
+                hex_color = "#2563eb"
+                dashes = True
             else:
-                hex_color = "#374151"   # dark gray for LLM
-                dashes    = False
+                hex_color = "#374151"
+                dashes = False
 
-            # Apply opacity by converting to rgba
             r = int(hex_color[1:3], 16)
             g = int(hex_color[3:5], 16)
             b = int(hex_color[5:7], 16)
             edge_color = f"rgba({r},{g},{b},{opacity})"
 
-            tooltip = (
-                f"{rel}\n"
-                f"source: {src}\n"
-                f"confidence: {confidence:.2f}"
-            )
+            tooltip_lines = [
+                f"{rel}",
+                f"source: {src}",
+                f"confidence: {confidence:.2f}",
+            ]
             if data.get("glirel_confirmed"):
-                tooltip += "\n✓ GLiREL confirmed"
+                tooltip_lines.append("✓ GLiREL confirmed")
+            if data.get("wikidata_property"):
+                tooltip_lines.append(f"Wikidata property: {data['wikidata_property']}")
+            if data.get("wikidata_date"):
+                tooltip_lines.append(f"Date: {data['wikidata_date']}")
+            if data.get("needs_review"):
+                tooltip_lines.append("⚠️ Needs review")
+            tooltip = "\n".join(tooltip_lines)
 
             net.add_edge(
                 u, v,
@@ -287,11 +229,7 @@ class Neo4jExporter:
           "nodes": {
             "shape": "dot",
             "shadow": true,
-            "font": {
-              "color": "#111827",
-              "size": 16,
-              "face": "arial"
-            }
+            "font": { "color": "#111827", "size": 16, "face": "arial" }
           },
           "edges": {
             "smooth": { "type": "dynamic", "roundness": 0.25 },
@@ -311,17 +249,11 @@ class Neo4jExporter:
             "hideEdgesOnDrag": true,
             "hideEdgesOnZoom": false
           },
-          "layout": {
-            "improvedLayout": true
-          }
+          "layout": { "improvedLayout": true }
         }
         """)
-
         net.write_html(output_path)
-        log.info(
-            "graph_html_exported",
-            path=output_path,
-            nodes=render_graph.number_of_nodes(),
-            edges=render_graph.number_of_edges(),
-            top_n_cap=top_n_nodes,
-        )
+        log.info("graph_html_exported", path=output_path,
+                 nodes=render_graph.number_of_nodes(),
+                 edges=render_graph.number_of_edges(),
+                 top_n_cap=top_n_nodes)

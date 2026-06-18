@@ -1,20 +1,3 @@
-"""
-src/relations/relation_extractor.py
-
-LLM-based relation + event-label extractor.
-
-Changes vs previous version:
-  - LLM_SYSTEM_PROMPT now instructs the model to pick from a predefined
-    controlled vocabulary (CANONICAL_RELATION_LIST).  Both the canonical
-    label AND the original raw phrase are returned in every triple so the
-    graph stores both: raw for human readability, canonical for querying.
-  - Triple parsing handles the new `relation_raw` field and populates
-    RelationTriple.relation (raw) + RelationTriple.relation_canonical.
-  - If the model returns a label that is NOT in the vocabulary the extractor
-    validates it in _validate_canonical(); unknown labels are remapped via
-    the relation_ontology at call-site rather than silently stored as-is.
-  - All rate-limit / retry / provider-routing logic is unchanged.
-"""
 
 import json
 import re

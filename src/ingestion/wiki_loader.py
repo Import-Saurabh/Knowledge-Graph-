@@ -47,7 +47,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 SEARCH_QUERIES = [
     "Iran United States war 2026",
     "2026 attack on Iran",
-    "Operation Midnight Hammer",
     "Iran nuclear program 2026",
     "Iran Israel conflict 2026",
     "Iran military 2026",
