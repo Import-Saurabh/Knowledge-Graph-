@@ -16,10 +16,13 @@ SIMILARITY_THRESHOLD = 0.88
 FUZZY_THRESHOLD = 85
 
 class EntityResolver:
-    def __init__(self, chroma_manager, embedding_generator):
+    def __init__(self, chroma_manager, embedding_generator, wikidata_linker=None):
         self.chroma = chroma_manager
         self.embedder = embedding_generator
+        self.wikidata_linker = wikidata_linker  # store for potential future use
         self._cache = {}
+        if wikidata_linker:
+            log.info("wikidata_linker_attached_to_resolver")
 
     def _normalize(self, text: str) -> str:
         text = text.strip()
@@ -220,10 +223,6 @@ class EntityResolver:
         canonical_name = mention.text.strip()
 
         # --- UPSERT GUARD ---
-        # Check for an existing entity with this canonical_name before inserting.
-        # Without this, every re-run raises `UNIQUE constraint failed:
-        # canonical_entities.canonical_name` for high-frequency entities like
-        # "Iran", "Israel", etc., causing all their resolutions to fail.
         existing_db = session.query(CanonicalEntityDB).filter_by(canonical_name=canonical_name).first()
         if existing_db:
             session.close()
@@ -284,9 +283,6 @@ class EntityResolver:
         try:
             session.commit()
         except Exception as e:
-            # Last-ditch safety net: another thread/process may have inserted
-            # the same name between our SELECT and this INSERT.  Roll back and
-            # re-fetch rather than propagating the error.
             session.rollback()
             session.close()
             log.warning("entity_create_race_retry", canonical_name=canonical_name, error=str(e))
