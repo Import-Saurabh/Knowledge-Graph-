@@ -1,4 +1,3 @@
-
 import argparse
 import json
 import os
@@ -7,7 +6,9 @@ import time
 import urllib.error
 from contextlib import contextmanager
 from datetime import datetime, timezone
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from src.ingestion.article_loader import ArticleLoader
 from src.ingestion.news_downloader import NewsDownloader
 from src.ingestion.infobox_extractor import InfoboxExtractor
@@ -28,55 +29,40 @@ from src.utils.logger import get_logger
 from src.utils.db import init_db, get_session, ArticleDB, CanonicalEntityDB
 from src.utils.config import settings
 from src.models.relation import LLMRelationResponse
+
 log = get_logger(__name__)
+
+
 @contextmanager
-
 def managed_session():
-
     session = get_session()
-
     try:
-
         yield session
-
     except Exception:
-
         session.rollback()
-
         raise
-
     finally:
-
         session.close()
+
+
 def _load_canonical_map_from_db(resolver: EntityResolver) -> dict:
-
-    """BUG #2 FIX: rebuild canonical_map from SQLite when resuming past stage 3."""
-
+    """Rebuild canonical_map from SQLite when resuming past stage 3."""
     canonical_map = {}
-
     with managed_session() as session:
-
         db_entities = session.query(CanonicalEntityDB).all()
-
         for db_ent in db_entities:
-
             entity = resolver._db_to_model(db_ent)
-
             canonical_map[entity.canonical_id] = entity
-
     log.info("canonical_map_loaded_from_db", count=len(canonical_map))
-
     return canonical_map
 
+
 def _run_wiki_download(args) -> (str, list):
-    """
-    Fetch Wikipedia articles via wiki_loader and return the output directory
-    and the list of article titles (for infobox extraction).
-    """
+    """Fetch Wikipedia articles via wiki_loader."""
     from src.ingestion.wiki_loader import fetch_all, ingest_to_db
 
     start = datetime.fromisoformat(args.start_date).replace(tzinfo=timezone.utc)
-    end   = datetime.fromisoformat(args.end_date).replace(tzinfo=timezone.utc)
+    end = datetime.fromisoformat(args.end_date).replace(tzinfo=timezone.utc)
     out_dir = args.wiki_dir
 
     log.info("wiki_fetch_start",
@@ -94,18 +80,33 @@ def _run_wiki_download(args) -> (str, list):
 
     return out_dir, titles
 
+
+def _get_all_articles() -> list:
+    """Fetch all articles from the database (regardless of status)."""
+    from src.models.article import ArticleModel
+    with managed_session() as session:
+        db_articles = session.query(ArticleDB).all()
+        return [
+            ArticleModel(
+                id=a.id,
+                title=a.title,
+                content=a.content,
+                source=getattr(a, 'source', 'unknown'),
+                published_at=getattr(a, 'published_at', None),
+                url=getattr(a, 'url', f"https://example.com/article/{a.id}"),  # default if missing
+            )
+            for a in db_articles
+        ]
+
+
 def run_pipeline(args):
-
     os.makedirs("data/exports", exist_ok=True)
-
     os.makedirs("data/processed", exist_ok=True)
 
     init_db()
 
     embedder = EmbeddingGenerator()
-
-    chroma   = ChromaManager()
-
+    chroma = ChromaManager()
     ontology = OntologyManager(chroma, embedder)
 
     # ------------------------------------------------------------------ #
@@ -115,7 +116,7 @@ def run_pipeline(args):
     loader = ArticleLoader()
     wiki_titles = []
 
-    # --wiki: Wikipedia fetch (replaces / supplements GNews)
+    # --wiki: Wikipedia fetch
     if args.wiki:
         wiki_dir, wiki_titles = _run_wiki_download(args)
         if not args.download:
@@ -141,14 +142,11 @@ def run_pipeline(args):
 
     # Load from directory
     articles = loader.load_from_directory(args.input)
-    result   = loader.ingest_to_db(articles)
+    result = loader.ingest_to_db(articles)
     log.info("ingestion_complete", **result)
 
     # ------------------------------------------------------------------ #
     # Stage 1b: Infobox extraction (for Wikipedia articles)               #
-    # ------------------------------------------------------------------ #
-    # ------------------------------------------------------------------ #
-# Stage 1b: Infobox extraction (for Wikipedia articles)               #
     # ------------------------------------------------------------------ #
     infobox_triples = []
     if args.extract_infoboxes:
@@ -188,26 +186,32 @@ def run_pipeline(args):
             log.info("infobox_extraction_complete", triples=len(infobox_triples))
         else:
             log.warning("infobox_skipped_no_titles", hint="No Wikipedia articles found.")
-        # ------------------------------------------------------------------ #
-    # Resume logic                                                         #
+
+    # ------------------------------------------------------------------ #
+    # Resume logic – determine which articles to process                #
     # ------------------------------------------------------------------ #
 
-    if args.from_stage <= 2:
-        unprocessed = loader.get_unprocessed_articles("ingested")
-    elif args.from_stage <= 6:
-        unprocessed = (
-            loader.get_unprocessed_articles("ingested")
-            or loader.get_unprocessed_articles("embedded")
-            or loader.get_unprocessed_articles("deduplicated")
-        )
+    # If --force is used, fetch ALL articles regardless of status.
+    if args.force:
+        unprocessed = _get_all_articles()
+        log.info("force_mode_active", article_count=len(unprocessed))
     else:
-        unprocessed = (
-            loader.get_unprocessed_articles("embedded")
-            or loader.get_unprocessed_articles("deduplicated")
-            or loader.get_unprocessed_articles("clustered")
-        )
+        if args.from_stage <= 2:
+            unprocessed = loader.get_unprocessed_articles("ingested")
+        elif args.from_stage <= 6:
+            unprocessed = (
+                loader.get_unprocessed_articles("ingested")
+                or loader.get_unprocessed_articles("embedded")
+                or loader.get_unprocessed_articles("deduplicated")
+            )
+        else:
+            unprocessed = (
+                loader.get_unprocessed_articles("embedded")
+                or loader.get_unprocessed_articles("deduplicated")
+                or loader.get_unprocessed_articles("clustered")
+            )
 
-    if not unprocessed and args.from_stage <= 2:
+    if not unprocessed and args.from_stage <= 2 and not args.force:
         log.info("no_new_articles")
         return
 
@@ -217,9 +221,9 @@ def run_pipeline(args):
     # Stage 2: GLiNER NER                                                  #
     # ------------------------------------------------------------------ #
 
-    all_mentions        = []
+    all_mentions = []
     article_to_mentions = {}
-    extractor           = None
+    extractor = None
 
     if args.from_stage <= 2:
         extractor = EntityExtractor(
@@ -294,13 +298,13 @@ def run_pipeline(args):
 
     if args.from_stage <= 4:
         article_embeddings = embedder.embed_articles(unprocessed)
-        article_lookup     = {a.id: a for a in unprocessed}
+        article_lookup = {a.id: a for a in unprocessed}
         chroma.add_articles(
             ids=[ae[0] for ae in article_embeddings],
             embeddings=[ae[1] for ae in article_embeddings],
             metadatas=[
                 {
-                    "title":  article_lookup[ae[0]].title,
+                    "title": article_lookup[ae[0]].title,
                     "source": article_lookup[ae[0]].source,
                 }
                 for ae in article_embeddings
@@ -313,7 +317,7 @@ def run_pipeline(args):
     # ------------------------------------------------------------------ #
 
     if args.from_stage <= 6:
-        dedup      = DuplicateDetector(chroma, embedder)
+        dedup = DuplicateDetector(chroma, embedder)
         duplicates = dedup.find_duplicates(unprocessed)
         if duplicates:
             dedup.mark_duplicates(duplicates)
@@ -331,9 +335,9 @@ def run_pipeline(args):
 
     if args.from_stage <= 7:
         clusterer = EventClusterer(embedder=embedder)
-        clusters  = clusterer.run_all_windows(non_dup_articles)
+        clusters = clusterer.run_all_windows(non_dup_articles)
         builder = EventBuilder()
-        events  = [builder.build_event(c) for c in clusters]
+        events = [builder.build_event(c) for c in clusters]
     else:
         log.info("resuming_events_from_db", from_stage=args.from_stage)
         events = EventBuilder.load_from_db()
@@ -360,9 +364,9 @@ def run_pipeline(args):
                     ArticleDB.id.in_(event.article_ids)
                 ).update(
                     {
-                        ArticleDB.cluster_id:      event.cluster_id,
+                        ArticleDB.cluster_id: event.cluster_id,
                         ArticleDB.temporal_window: event.temporal_window,
-                        ArticleDB.status:          "clustered",
+                        ArticleDB.status: "clustered",
                     },
                     synchronize_session=False,
                 )
@@ -391,7 +395,7 @@ def run_pipeline(args):
 
         total_events = len(events)
         for i in range(0, total_events, args.llm_batch_size):
-            batch     = events[i:i + args.llm_batch_size]
+            batch = events[i:i + args.llm_batch_size]
             batch_end = min(i + args.llm_batch_size, total_events)
             log.info("llm_extraction_batch",
                      batch_start=i, batch_end=batch_end,
@@ -413,15 +417,19 @@ def run_pipeline(args):
         for event, response in zip(events, llm_responses):
             try:
                 for triple in response.triples:
-                    # Normalize relation with Wikidata if enabled
+                    # --- FIX: only normalize if LLM gave a non-seed label ---
                     if relation_ontology:
-                        if args.use_wikidata_relation_normalization and not args.skip_wikidata:
-                            canonical, wikidata_prop = relation_ontology.normalize_relation_with_wikidata(triple.relation)
-                            triple.relation_canonical = canonical
-                            triple.wikidata_property = wikidata_prop
-                        else:
+                        # If the LLM's canonical is already a seed label, keep it.
+                        # Otherwise, try to map from the raw phrase.
+                        if not relation_ontology.is_seed_canonical(triple.relation_canonical):
                             triple.relation_canonical = relation_ontology.normalize_relation(triple.relation)
+
+                        # Optionally fetch Wikidata property without altering canonical
+                        if args.use_wikidata_relation_normalization and not args.skip_wikidata:
+                            triple.wikidata_property = relation_ontology.get_wikidata_property(triple.relation)
+
                     triple.event_id = event.event_id
+
                 if settings.ENABLE_TYPE_INDUCTION:
                     for disc in response.discovered_entity_types:
                         ontology.induce_type(
@@ -541,7 +549,7 @@ def run_pipeline(args):
     # ------------------------------------------------------------------ #
 
     metrics = GraphMetrics()
-    report  = metrics.compute_all(graph)
+    report = metrics.compute_all(graph)
     metrics.save_report(report, "data/exports/analytics_report.json")
 
     # ------------------------------------------------------------------ #
@@ -549,9 +557,9 @@ def run_pipeline(args):
     # ------------------------------------------------------------------ #
 
     exporter = Neo4jExporter()
-    exporter.export_nodes_csv(graph,         "data/exports/nodes.csv")
+    exporter.export_nodes_csv(graph, "data/exports/nodes.csv")
     exporter.export_relationships_csv(graph, "data/exports/relationships.csv")
-    exporter.export_pyvis_html(graph,        "data/exports/graph.html", top_n_nodes=200)
+    exporter.export_pyvis_html(graph, "data/exports/graph.html", top_n_nodes=200)
 
     ontology_report = {
         "entity_types": ontology.get_ontology_report(),
@@ -576,6 +584,7 @@ def run_pipeline(args):
         entity_types=len(ontology_report["entity_types"].get("top_types", [])),
         relation_types=len(ontology_report["relation_types"]),
     )
+
 
 # --------------------------------------------------------------------------- #
 # CLI                                                                          #
@@ -603,17 +612,25 @@ if __name__ == "__main__":
     parser.add_argument("--daily", action="store_true",
                         help="Daily mode: only process new articles")
 
+    # ── Force reprocess all articles ──────────────────────────────────
+    parser.add_argument("--force", action="store_true",
+                        help="Ignore article status and reprocess ALL articles from the given --from-stage.")
+
+    # ── One‑time duplicate merge ─────────────────────────────────────
+    parser.add_argument("--merge-duplicate-entities", action="store_true",
+                        help="One-time cleanup: merge duplicate canonical entities in the DB and exit.")
+
     # ── NER / relation flags ───────────────────────────────────────────
-    parser.add_argument("--fast",        action="store_true",
+    parser.add_argument("--fast", action="store_true",
                         help="Use spaCy fallback instead of GLiNER")
-    parser.add_argument("--skip-llm",    action="store_true",
+    parser.add_argument("--skip-llm", action="store_true",
                         help="Skip LLM relation extraction (Stage 9)")
     parser.add_argument("--skip-glirel", action="store_true",
                         help="Skip GLiREL zero-shot relation pass (Stage 2b)")
 
     # ── LLM controls ──────────────────────────────────────────────────
     parser.add_argument("--llm-batch-size", type=int, default=10)
-    parser.add_argument("--llm-workers",    type=int, default=5)
+    parser.add_argument("--llm-workers", type=int, default=5)
 
     # ── Wikidata enrichment ───────────────────────────────────────────
     parser.add_argument("--skip-wikidata", action="store_true",
@@ -643,9 +660,9 @@ if __name__ == "__main__":
     # ── GNews download ────────────────────────────────────────────────
     parser.add_argument("--download", action="store_true",
                         help="Download articles from Google News via gnews")
-    parser.add_argument("--topic",             default="Iran war 2026")
-    parser.add_argument("--interval-days",     type=int, default=3)
-    parser.add_argument("--max-per-interval",  type=int, default=50)
+    parser.add_argument("--topic", default="Iran war 2026")
+    parser.add_argument("--interval-days", type=int, default=3)
+    parser.add_argument("--max-per-interval", type=int, default=50)
     parser.add_argument(
         "--categories", nargs="+", default=None, metavar="CATEGORY",
         help=(
@@ -658,10 +675,20 @@ if __name__ == "__main__":
     # ── Shared date range ─────────────────────────────────────────────
     parser.add_argument("--start-date", default="2026-02-28",
                         help="Start date YYYY-MM-DD")
-    parser.add_argument("--end-date",   default="2026-04-01",
+    parser.add_argument("--end-date", default="2026-04-01",
                         help="End date YYYY-MM-DD")
 
     args = parser.parse_args()
+
+    # If --merge-duplicate-entities is given, run the merge and exit.
+    if args.merge_duplicate_entities:
+        init_db()
+        embedder = EmbeddingGenerator()
+        chroma = ChromaManager()
+        resolver = EntityResolver(chroma, embedder)
+        merged = resolver.find_and_merge_duplicates()
+        log.info("duplicate_merge_complete", pairs_merged=merged)
+        sys.exit(0)
 
     if args.wiki and not args.download and args.input == "data/raw/":
         args.input = args.wiki_dir

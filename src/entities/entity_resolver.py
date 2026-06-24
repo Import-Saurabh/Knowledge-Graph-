@@ -30,6 +30,83 @@ class EntityResolver:
         text = re.sub(r"[.,;:!?]$", "", text)
         return text.lower()
 
+    # ------------------------------------------------------------------
+    # DUPLICATE-RESOLUTION FIX
+    # ------------------------------------------------------------------
+    # The fuzzy (token_sort_ratio) + semantic fusion pipeline below needs a
+    # candidate alias to already be "close" character-for-character or
+    # embedding-wise. Two very common real-world coreference patterns never
+    # clear that bar, so they always minted brand-new duplicate entities:
+    #
+    #   1. Acronyms vs. full names — "US" vs "United States",
+    #      "IRGC" vs "Islamic Revolutionary Guards Corps".
+    #      fuzz.token_sort_ratio("us", "united states") ≈ 18 — nowhere near
+    #      FUZZY_THRESHOLD=85, so no candidate is ever even considered.
+    #
+    #   2. Partial person names — "Trump" vs "Donald Trump".
+    #      fuzz.token_sort_ratio("trump", "donald trump") ≈ 59 — also below
+    #      threshold, so "President Trump" mentions never matched the
+    #      "Donald Trump" entity created earlier.
+    #
+    # These two checks run BEFORE the fuzzy/semantic pipeline as a cheap,
+    # high-precision exact pass. They look at the canonical_name AND all
+    # known aliases of every existing entity.
+
+    @staticmethod
+    def _is_acronym_match(raw_text: str, candidate_name: str) -> bool:
+        """True if raw_text is an ALL-CAPS acronym of candidate_name's words.
+        e.g. "IRGC" <-> "Islamic Revolutionary Guards Corps"."""
+        token = raw_text.strip()
+        if not (2 <= len(token) <= 6 and token.isalpha() and token.isupper()):
+            return False
+        words = re.findall(r"[A-Za-z]+", candidate_name)
+        if len(words) < 2:
+            return False
+        initials = "".join(w[0] for w in words).upper()
+        return initials == token.upper()
+
+    @staticmethod
+    def _is_partial_name_match(normalized: str, candidate_name: str,
+                               entity_type: str = "") -> bool:
+        """True if `normalized` is a strict, whole-word subset of a longer
+        candidate name — e.g. "trump" <-> "donald trump". Restricted to
+        person-like mentions to avoid false merges between unrelated
+        multi-word organisations/places that happen to share one word."""
+        if entity_type and entity_type.lower() != "person":
+            return False
+        cand_tokens = re.sub(r"[.,;:!?]$", "", candidate_name.strip().lower()).split()
+        mention_tokens = normalized.split()
+        if not mention_tokens or len(cand_tokens) < 2:
+            return False
+        if len(mention_tokens) >= len(cand_tokens):
+            return False
+        if not all(len(t) >= 3 for t in mention_tokens):
+            return False
+        return all(t in cand_tokens for t in mention_tokens)
+
+    def _exact_alias_match(self, raw_text: str, normalized: str,
+                           entity_type: str = "") -> Optional[CanonicalEntity]:
+        """Pass 1: cheap, high-precision acronym / partial-name lookup
+        against every existing canonical entity (name + aliases)."""
+        session = get_session()
+        try:
+            rows = session.query(CanonicalEntityDB).all()
+            for db in rows:
+                names = [db.canonical_name]
+                try:
+                    names += json.loads(db.aliases) if db.aliases else []
+                except Exception:
+                    pass
+                for name in names:
+                    if not name:
+                        continue
+                    if self._is_acronym_match(raw_text, name) or \
+                       self._is_partial_name_match(normalized, name, entity_type):
+                        return self._db_to_model(db)
+        finally:
+            session.close()
+        return None
+
     def _fuzzy_search_aliases(self, normalized: str, top_k: int = 5) -> List[dict]:
         session = get_session()
         aliases = session.query(EntityAliasDB).all()
@@ -120,6 +197,18 @@ class EntityResolver:
 
     def resolve(self, mention: EntityMention) -> CanonicalEntity:
         normalized = self._normalize(mention.text)
+
+        # Pass 1: acronym / partial-name exact match (see block above) —
+        # cheap and high-precision, so it short-circuits the rest.
+        exact_match = self._exact_alias_match(
+            mention.text, normalized, getattr(mention, "entity_type", "") or ""
+        )
+        if exact_match:
+            log.info(
+                "entity_resolved_exact_match",
+                mention=mention.text, canonical=exact_match.canonical_name,
+            )
+            return self._update_entity(exact_match, mention, normalized)
 
         # Pass 2: Fuzzy search
         fuzzy_candidates = self._fuzzy_search_aliases(normalized, top_k=5)
@@ -321,3 +410,116 @@ class EntityResolver:
 
         log.info("entity_created", canonical_name=canonical_name, type=type_name)
         return entity
+
+    # ------------------------------------------------------------------
+    # One-time cleanup: merge duplicates already sitting in the DB
+    # ------------------------------------------------------------------
+    # Fixing `resolve()` only prevents *new* duplicates going forward — it
+    # can't retroactively fix "US" / "United States" / "IRGC" / "Donald
+    # Trump" pairs that were already created as separate canonical rows by
+    # earlier runs. Run this once (see main.py --merge-duplicate-entities)
+    # before re-exporting the graph.
+
+    def find_and_merge_duplicates(self) -> int:
+        """
+        Scan every CanonicalEntityDB row for acronym/partial-name duplicates
+        using the same predicates `resolve()` uses, merge each duplicate
+        pair (re-pointing aliases/mentions, summing mention_count, unioning
+        alias lists), and delete the loser row. Returns the number of pairs
+        merged. Safe to re-run — it's idempotent once no duplicates remain.
+        """
+        session = get_session()
+        try:
+            from src.utils.db import EntityOntologyDB
+            type_rows = session.query(EntityOntologyDB).all()
+            type_name_by_id = {t.type_id: t.type_name for t in type_rows}
+
+            rows = session.query(CanonicalEntityDB).all()
+            # Survivor is whichever row has more mentions (ties broken by
+            # earlier first_seen) so the more "established" name/aliases win.
+            rows.sort(key=lambda r: (-(r.mention_count or 0), r.first_seen or datetime.max))
+
+            merged_away: set = set()
+            merge_count = 0
+
+            for i, row_a in enumerate(rows):
+                if row_a.canonical_id in merged_away:
+                    continue
+                names_a = [row_a.canonical_name]
+                try:
+                    names_a += json.loads(row_a.aliases) if row_a.aliases else []
+                except Exception:
+                    pass
+                type_a = type_name_by_id.get(row_a.type_id, "")
+
+                for row_b in rows[i + 1:]:
+                    if row_b.canonical_id in merged_away or row_b.canonical_id == row_a.canonical_id:
+                        continue
+                    type_b = type_name_by_id.get(row_b.type_id, "")
+                    norm_b = self._normalize(row_b.canonical_name)
+                    is_dup = any(
+                        self._is_acronym_match(row_b.canonical_name, name_a) or
+                        self._is_acronym_match(name_a, row_b.canonical_name) or
+                        self._is_partial_name_match(norm_b, name_a, type_b) or
+                        self._is_partial_name_match(self._normalize(name_a), row_b.canonical_name, type_a)
+                        for name_a in names_a
+                    )
+                    if not is_dup:
+                        continue
+
+                    self._merge_rows(session, survivor=row_a, loser=row_b)
+                    merged_away.add(row_b.canonical_id)
+                    merge_count += 1
+                    log.info(
+                        "duplicate_entities_merged",
+                        survivor=row_a.canonical_name,
+                        loser=row_b.canonical_name,
+                    )
+
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            log.error("merge_duplicates_failed", error=str(e))
+            raise
+        finally:
+            session.close()
+
+        return merge_count
+
+    def _merge_rows(self, session, survivor: CanonicalEntityDB, loser: CanonicalEntityDB) -> None:
+        """Re-point loser's aliases/mentions onto survivor, union alias
+        lists, sum mention counts, widen the first/last-seen range, then
+        delete the loser row. Caller owns the session/commit."""
+        try:
+            survivor_aliases = json.loads(survivor.aliases) if survivor.aliases else []
+        except Exception:
+            survivor_aliases = []
+        try:
+            loser_aliases = json.loads(loser.aliases) if loser.aliases else []
+        except Exception:
+            loser_aliases = []
+
+        merged_aliases = list(dict.fromkeys(
+            survivor_aliases + [loser.canonical_name] + loser_aliases
+        ))
+        survivor.aliases = json.dumps(merged_aliases)
+        survivor.mention_count = (survivor.mention_count or 0) + (loser.mention_count or 0)
+        if loser.first_seen and (not survivor.first_seen or loser.first_seen < survivor.first_seen):
+            survivor.first_seen = loser.first_seen
+        if loser.last_seen and (not survivor.last_seen or loser.last_seen > survivor.last_seen):
+            survivor.last_seen = loser.last_seen
+
+        session.query(EntityAliasDB).filter_by(canonical_id=loser.canonical_id).update(
+            {EntityAliasDB.canonical_id: survivor.canonical_id}, synchronize_session=False,
+        )
+        session.query(MentionDB).filter_by(canonical_id=loser.canonical_id).update(
+            {MentionDB.canonical_id: survivor.canonical_id}, synchronize_session=False,
+        )
+        session.delete(loser)
+
+        if self.chroma:
+            try:
+                self.chroma.delete_entities(ids=[loser.canonical_id])
+            except Exception as e:
+                log.warning("chroma_delete_on_merge_failed",
+                           loser_id=loser.canonical_id, error=str(e))

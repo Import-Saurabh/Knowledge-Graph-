@@ -5,6 +5,7 @@ Builds a NetworkX DiGraph from LLM, GLiREL, and infobox triples.
 Now also accepts entity_enrichment from Wikidata and infobox_triples.
 """
 
+import re
 import networkx as nx
 from typing import List, Dict, Optional, Tuple
 
@@ -14,6 +15,27 @@ from src.models.entity import CanonicalEntity
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _is_junk_node(node_id: str, data: Dict) -> bool:
+    """
+    A node is junk if it never went through entity resolution at all:
+    it has no canonical (UUID) id, no recognised type, and zero recorded
+    mentions. These are stub nodes created purely as edge endpoints for a
+    triple whose head/tail text never matched anything in `name_to_id`
+    (e.g. "Yak-130", "53", "23 provinces") — never real graph citizens.
+    Event nodes are always kept.
+    """
+    if data.get("type") == "Event":
+        return False
+    has_uuid_id = bool(_UUID_RE.match(str(node_id)))
+    is_unknown_type = data.get("type", "Unknown") == "Unknown"
+    has_no_mentions = int(data.get("mention_count", 0) or 0) <= 0
+    return is_unknown_type and not has_uuid_id and has_no_mentions
 
 class GraphBuilder:
     LLM_CONF_THRESHOLD:   float = 0.70
@@ -59,12 +81,20 @@ class GraphBuilder:
         if triple.confidence < self.LLM_CONF_THRESHOLD:
             return
 
+        # PROVENANCE FIX: LLM-sourced edges never carried article_id, leaving
+        # the exported relationships.csv column empty for every LLM edge.
+        # RelationTriple already carries source_article_ids (set in
+        # relation_extractor.py from event.article_ids) — surface it here.
+        article_ids = getattr(triple, "source_article_ids", None) or []
+        article_id_str = ";".join(article_ids)
+
         if triple.source and event_id:
             self.graph.add_edge(
                 triple.source, event_id,
                 relation="PARTICIPATES_IN",
                 confidence=triple.confidence,
                 event_id=event_id,
+                article_id=article_id_str,
                 source="llm",
             )
         if triple.target and event_id:
@@ -73,6 +103,7 @@ class GraphBuilder:
                 relation="PARTICIPATES_IN",
                 confidence=triple.confidence,
                 event_id=event_id,
+                article_id=article_id_str,
                 source="llm",
             )
 
@@ -86,6 +117,7 @@ class GraphBuilder:
                 "relation": rel_label,
                 "confidence": triple.confidence,
                 "event_id": event_id,
+                "article_id": article_id_str,
                 "original_relation": triple.relation,
                 "source": "llm",
                 "wikidata_property": triple.wikidata_property,
@@ -96,7 +128,8 @@ class GraphBuilder:
             self.graph.add_edge(triple.source, triple.target, **edge_attrs)
 
     def _add_glirel_edge(self, head_id: str, tail_id: str, relation: str,
-                         score: float, article_id: str) -> None:
+                         score: float, article_id: str,
+                         original_relation: Optional[str] = None) -> None:
         if score < self.GLIREL_SCORE_THRESHOLD:
             return
         if self.graph.has_edge(head_id, tail_id):
@@ -110,7 +143,7 @@ class GraphBuilder:
             confidence=score,
             event_id="",
             article_id=article_id,
-            original_relation=relation,
+            original_relation=original_relation or relation,
             source="glirel",
             glirel_confirmed=True,
             glirel_score=score,
@@ -120,7 +153,10 @@ class GraphBuilder:
         to_remove = [
             n for n, data in self.graph.nodes(data=True)
             if data.get("type") != "Event"
-            and self.graph.degree(n) < self.MIN_NODE_DEGREE
+            and (
+                self.graph.degree(n) < self.MIN_NODE_DEGREE
+                or _is_junk_node(n, data)
+            )
         ]
         self.graph.remove_nodes_from(to_remove)
         return len(to_remove)
@@ -164,6 +200,7 @@ class GraphBuilder:
         glirel_triples: Optional[List[dict]] = None,
         entity_enrichment: Optional[Dict[str, Dict]] = None,
         infobox_triples: Optional[List[Tuple[str, str, str]]] = None,
+        relation_ontology=None,
     ) -> nx.DiGraph:
         name_to_id: Dict[str, str] = {}
         if entity_map:
@@ -211,22 +248,34 @@ class GraphBuilder:
             for t in glirel_triples:
                 head_raw = (t.get("head") or "").strip()
                 tail_raw = (t.get("tail") or "").strip()
-                relation = (t.get("relation") or "").strip()
+                relation_raw = (t.get("relation") or "").strip()
                 score = float(t.get("score", 0.0))
                 art_id = t.get("article_id", "")
-                if not head_raw or not tail_raw or not relation:
+                if not head_raw or not tail_raw or not relation_raw:
                     continue
                 if head_raw.lower() == tail_raw.lower():
                     continue
                 if score < self.GLIREL_SCORE_THRESHOLD:
                     glirel_dropped += 1
                     continue
+                # GENERALIZE-RELATIONS FIX: GLiREL labels used to go straight
+                # onto the edge verbatim (lowercase human phrases like
+                # "attacked"), inconsistent with the canonical UPPER_SNAKE
+                # vocabulary used for LLM edges. Run them through the same
+                # ontology so the whole graph shares one relation vocabulary.
+                if relation_ontology:
+                    relation_canonical = relation_ontology.normalize_relation(relation_raw)
+                else:
+                    relation_canonical = relation_raw
                 head_id = name_to_id.get(head_raw.lower(), head_raw)
                 tail_id = name_to_id.get(tail_raw.lower(), tail_raw)
                 self._ensure_entity_stub(head_id, head_raw)
                 self._ensure_entity_stub(tail_id, tail_raw)
                 existed = self.graph.has_edge(head_id, tail_id)
-                self._add_glirel_edge(head_id, tail_id, relation, score, art_id)
+                self._add_glirel_edge(
+                    head_id, tail_id, relation_canonical, score, art_id,
+                    original_relation=relation_raw,
+                )
                 if existed:
                     glirel_merged += 1
                 else:
@@ -248,6 +297,14 @@ class GraphBuilder:
                         confidence=0.95,
                         source="infobox",
                         event_id="",
+                        # NOTE: InfoboxExtractor doesn't carry the source
+                        # Wikipedia article's id through its (subject,
+                        # relation, object) triples today, so there's no
+                        # per-edge article_id to attach here. If you want
+                        # provenance on infobox edges, extend
+                        # InfoboxExtractor.extract_from_wikitext() to return
+                        # (subject, relation, object, article_id) 4-tuples.
+                        article_id="",
                         original_relation=relation,
                     )
                     added += 1

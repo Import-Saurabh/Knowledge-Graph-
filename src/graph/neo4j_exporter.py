@@ -7,6 +7,7 @@ Includes Wikidata fields and infobox source.
 
 import csv
 import hashlib
+import re
 import networkx as nx
 
 from src.utils.logger import get_logger
@@ -19,6 +20,28 @@ _COMMUNITY_PALETTE = [
     "#1f77b4", "#aec7e8", "#ffbb78", "#2ca02c", "#98df8a",
     "#d62728", "#ff9896", "#9467bd", "#c5b0d5", "#8c564b",
 ]
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _is_junk_node(node_id, data: dict) -> bool:
+    """
+    DROP-JUNK-NODES FIX (defensive copy of graph_builder._is_junk_node):
+    skip nodes that never resolved to a real canonical entity — no UUID id,
+    no recognised type, zero recorded mentions (e.g. "Yak-130", "53",
+    "23 provinces"). GraphBuilder already prunes these before export, but
+    the exporter checks again so it stays correct even if it's ever called
+    on a graph that wasn't built/pruned through GraphBuilder.
+    """
+    if data.get("type") == "Event":
+        return False
+    has_uuid_id = bool(_UUID_RE.match(str(node_id)))
+    is_unknown_type = data.get("type", "Unknown") == "Unknown"
+    has_no_mentions = int(data.get("mention_count", 0) or 0) <= 0
+    return is_unknown_type and not has_uuid_id and has_no_mentions
+
 
 def _community_color(community_id: int | None) -> str:
     if community_id is None:
@@ -43,7 +66,10 @@ class Neo4jExporter:
                 "temporal_window", "community_id:INT",
                 "wikidata_id", "description", "types", "url",
             ])
+            exported = 0
             for node, data in graph.nodes(data=True):
+                if _is_junk_node(node, data):
+                    continue
                 types_list = data.get("types", [])
                 types_str = ";".join(types_list) if types_list else ""
                 writer.writerow([
@@ -59,7 +85,9 @@ class Neo4jExporter:
                     types_str,
                     data.get("url", ""),
                 ])
-        log.info("nodes_exported", path=output_path, count=graph.number_of_nodes())
+                exported += 1
+        log.info("nodes_exported", path=output_path, count=exported,
+                 skipped_junk=graph.number_of_nodes() - exported)
 
     def export_relationships_csv(self, graph: nx.DiGraph, output_path: str) -> None:
         with open(output_path, "w", newline="", encoding="utf-8") as f:
@@ -69,7 +97,10 @@ class Neo4jExporter:
                 "confidence:FLOAT", "event_id", "article_id", "edge_source",
                 "wikidata_property", "wikidata_date", "needs_review:BOOLEAN",
             ])
+            exported = 0
             for u, v, data in graph.edges(data=True):
+                if _is_junk_node(u, graph.nodes[u]) or _is_junk_node(v, graph.nodes[v]):
+                    continue
                 writer.writerow([
                     u,
                     v,
@@ -82,8 +113,9 @@ class Neo4jExporter:
                     data.get("wikidata_date", ""),
                     data.get("needs_review", False),
                 ])
-        log.info("relationships_exported", path=output_path,
-                 count=graph.number_of_edges())
+                exported += 1
+        log.info("relationships_exported", path=output_path, count=exported,
+                 skipped_junk=graph.number_of_edges() - exported)
 
     def export_pyvis_html(self, graph: nx.DiGraph, output_path: str,
                           top_n_nodes: int | None = None) -> None:
@@ -93,12 +125,17 @@ class Neo4jExporter:
             log.error("pyvis_not_installed", hint="pip install pyvis")
             return
 
-        render_graph = graph
-        if top_n_nodes is not None and graph.number_of_nodes() > top_n_nodes:
+        clean_nodes = [
+            n for n, data in graph.nodes(data=True) if not _is_junk_node(n, data)
+        ]
+        render_graph = graph.subgraph(clean_nodes).copy() \
+            if len(clean_nodes) != graph.number_of_nodes() else graph
+
+        if top_n_nodes is not None and render_graph.number_of_nodes() > top_n_nodes:
             top_nodes = sorted(
-                graph.nodes(), key=lambda n: graph.degree(n), reverse=True
+                render_graph.nodes(), key=lambda n: render_graph.degree(n), reverse=True
             )[:top_n_nodes]
-            render_graph = graph.subgraph(top_nodes).copy()
+            render_graph = render_graph.subgraph(top_nodes).copy()
             log.info("html_export_subgraph",
                      total_nodes=graph.number_of_nodes(),
                      rendered_nodes=render_graph.number_of_nodes(),

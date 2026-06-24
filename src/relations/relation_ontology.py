@@ -200,8 +200,8 @@ CONTROLLED_VOCABULARY: Dict[str, List[str]] = {
     ],
 }
 
-# Fast set for direct-canonical check (Stage 1)
-_CANONICAL_SET: set = set(CONTROLLED_VOCABULARY.keys())
+# Fast set for direct-canonical check (Stage 1) and for checking seed labels
+SEED_SET: set = set(CONTROLLED_VOCABULARY.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +300,15 @@ class RelationOntologyManager:
             self.precompute_vocab_embeddings()
 
     # ------------------------------------------------------------------
+    # Public: seed label check
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def is_seed_canonical(canonical: str) -> bool:
+        """Return True if the given canonical label is in the seed vocabulary."""
+        return canonical in SEED_SET
+
+    # ------------------------------------------------------------------
     # Public: normalisation
     # ------------------------------------------------------------------
 
@@ -316,7 +325,7 @@ class RelationOntologyManager:
 
         # ── Stage 1: direct canonical check ───────────────────────────
         upper = relation_text.strip().upper()
-        if upper in _CANONICAL_SET:
+        if upper in SEED_SET:
             log.debug("relation_normalized_direct", raw=relation_text, canonical=upper)
             return upper
 
@@ -366,13 +375,54 @@ class RelationOntologyManager:
         self, relation_text: str
     ) -> Tuple[str, Optional[str]]:
         canonical = self.normalize_relation(relation_text)
-        prop: Optional[str] = None
-        if self.wikidata_enabled:
-            prop = self._query_wikidata_property(relation_text)
+        prop = self.get_wikidata_property(relation_text) if self.wikidata_enabled else None
         if prop:
             log.debug("wikidata_property_mapped",
                       relation=relation_text, prop=prop, canonical=canonical)
         return canonical, prop
+
+    def get_wikidata_property(self, relation_text: str) -> Optional[str]:
+        """
+        Look up the closest Wikidata property for a relation phrase.
+        Hard-limited to 1 request per 65 seconds (WDQS policy).
+        Returns None immediately if the rate limiter blocks.
+        """
+        if not self.wikidata_enabled:
+            return None
+
+        phrase = relation_text.lower().strip()
+        if phrase in self._wikidata_property_cache:
+            return self._wikidata_property_cache[phrase]
+
+        if not _WIKIDATA_RL.try_acquire():
+            log.debug("wikidata_rate_limit_skipped", phrase=phrase)
+            return None
+
+        # Sanitise phrase for SPARQL string injection
+        safe_phrase = re.sub(r'["\\\n]', " ", phrase)[:60]
+
+        query = f"""
+        SELECT ?property ?propertyLabel WHERE {{
+          ?property a wikibase:Property .
+          ?property rdfs:label ?propertyLabel .
+          FILTER(LANG(?propertyLabel) = "en")
+          FILTER(CONTAINS(LCASE(?propertyLabel), "{safe_phrase}"))
+        }}
+        LIMIT 3
+        """
+        try:
+            self._sparql.setQuery(query)
+            results  = self._sparql.query().convert()
+            bindings = results["results"]["bindings"]
+            if bindings:
+                prop = bindings[0]["property"]["value"].split("/")[-1]
+                self._wikidata_property_cache[phrase] = prop
+                return prop
+        except Exception as e:
+            log.warning("wikidata_property_query_failed", phrase=phrase, error=str(e))
+
+        self._wikidata_property_cache[phrase] = None
+        return None
 
     # ------------------------------------------------------------------
     # Public: taxonomy & metadata
@@ -408,7 +458,7 @@ class RelationOntologyManager:
             if c not in groups:
                 groups[c] = {
                     "canonical":    c,
-                    "is_in_vocab":  c in _CANONICAL_SET,
+                    "is_in_vocab":  c in SEED_SET,
                     "usage_count":  0,
                     "phrase_count": 0,
                     "phrases":      [],
@@ -462,7 +512,7 @@ class RelationOntologyManager:
 
     def get_canonical_labels(self) -> List[str]:
         """Seed vocab labels + any emergent labels found in DB."""
-        seed = set(CONTROLLED_VOCABULARY.keys())
+        seed = set(SEED_SET)
         try:
             session  = get_session()
             emergent = {
@@ -476,7 +526,7 @@ class RelationOntologyManager:
         return sorted(seed | emergent)
 
     def is_in_vocabulary(self, canonical: str) -> bool:
-        return canonical in _CANONICAL_SET
+        return canonical in SEED_SET
 
     # ------------------------------------------------------------------
     # Private: similarity helpers
@@ -548,7 +598,7 @@ class RelationOntologyManager:
             return "RELATED_TO"
         label = "_".join(tokens[:6]).upper()   # cap at 6 tokens
         # Don't duplicate seed vocab labels
-        if label in _CANONICAL_SET:
+        if label in SEED_SET:
             label = label + "_EMERGENT"
         return label
 
@@ -639,50 +689,3 @@ class RelationOntologyManager:
             log.warning("increment_usage_failed", error=str(e))
         finally:
             session.close()
-
-    # ------------------------------------------------------------------
-    # Private: Wikidata (rate-limited)
-    # ------------------------------------------------------------------
-
-    def _query_wikidata_property(self, relation_phrase: str) -> Optional[str]:
-        """
-        Look up the closest Wikidata property for a relation phrase.
-        Hard-limited to 1 request per 65 seconds (WDQS policy).
-        Returns None immediately if the rate limiter blocks.
-        """
-        if not self.wikidata_enabled:
-            return None
-
-        phrase = relation_phrase.lower().strip()
-        if phrase in self._wikidata_property_cache:
-            return self._wikidata_property_cache[phrase]
-
-        if not _WIKIDATA_RL.try_acquire():
-            log.debug("wikidata_rate_limit_skipped", phrase=phrase)
-            return None
-
-        # Sanitise phrase for SPARQL string injection
-        safe_phrase = re.sub(r'["\\\n]', " ", phrase)[:60]
-
-        query = f"""
-        SELECT ?property ?propertyLabel WHERE {{
-          ?property a wikibase:Property .
-          ?property rdfs:label ?propertyLabel .
-          FILTER(LANG(?propertyLabel) = "en")
-          FILTER(CONTAINS(LCASE(?propertyLabel), "{safe_phrase}"))
-        }}
-        LIMIT 3
-        """
-        try:
-            self._sparql.setQuery(query)
-            results  = self._sparql.query().convert()
-            bindings = results["results"]["bindings"]
-            if bindings:
-                prop = bindings[0]["property"]["value"].split("/")[-1]
-                self._wikidata_property_cache[phrase] = prop
-                return prop
-        except Exception as e:
-            log.warning("wikidata_property_query_failed", phrase=phrase, error=str(e))
-
-        self._wikidata_property_cache[phrase] = None
-        return None
