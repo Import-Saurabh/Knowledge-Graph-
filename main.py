@@ -297,8 +297,11 @@ def run_pipeline(args):
     # ------------------------------------------------------------------ #
 
     if args.from_stage <= 4:
+        log.info("stage4_embedding_start", articles=len(unprocessed))
         article_embeddings = embedder.embed_articles(unprocessed)
+        log.info("stage4_embedding_done", embedded=len(article_embeddings))
         article_lookup = {a.id: a for a in unprocessed}
+        log.info("stage4_chroma_insert_start", count=len(article_embeddings))
         chroma.add_articles(
             ids=[ae[0] for ae in article_embeddings],
             embeddings=[ae[1] for ae in article_embeddings],
@@ -311,21 +314,25 @@ def run_pipeline(args):
             ],
         )
         loader.update_status([a.id for a in unprocessed], "embedded")
+        log.info("stage4_complete", articles_embedded=len(article_embeddings))
 
     # ------------------------------------------------------------------ #
     # Stage 6: Deduplication                                               #
     # ------------------------------------------------------------------ #
 
     if args.from_stage <= 6:
+        log.info("stage6_dedup_start", articles=len(unprocessed))
         dedup = DuplicateDetector(chroma, embedder)
         duplicates = dedup.find_duplicates(unprocessed)
         if duplicates:
             dedup.mark_duplicates(duplicates)
+            log.info("stage6_duplicates_found", count=len(duplicates))
         non_dup_articles = [
             a for a in unprocessed
             if a.id not in {d[0] for d in duplicates}
         ]
         loader.update_status([a.id for a in non_dup_articles], "deduplicated")
+        log.info("stage6_complete", unique_articles=len(non_dup_articles))
     else:
         non_dup_articles = unprocessed
 
@@ -334,10 +341,13 @@ def run_pipeline(args):
     # ------------------------------------------------------------------ #
 
     if args.from_stage <= 7:
+        log.info("stage7_clustering_start", articles=len(non_dup_articles))
         clusterer = EventClusterer(embedder=embedder)
         clusters = clusterer.run_all_windows(non_dup_articles)
+        log.info("stage7_clustering_done", clusters=len(clusters))
         builder = EventBuilder()
         events = [builder.build_event(c) for c in clusters]
+        log.info("stage8_events_built", events=len(events))
     else:
         log.info("resuming_events_from_db", from_stage=args.from_stage)
         events = EventBuilder.load_from_db()

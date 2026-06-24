@@ -240,7 +240,37 @@ class EntityResolver:
             return self._create_entity(mention, normalized, mention_embedding)
 
     def resolve_batch(self, mentions: List[EntityMention]) -> List[CanonicalEntity]:
-        return [self.resolve(m) for m in mentions]
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(mentions, desc="entity_resolution", unit="mention")
+        except ImportError:
+            iterator = mentions
+
+        results = []
+        resolved = 0
+        created = 0
+        _prev_canonical_count = 0
+
+        for i, mention in enumerate(iterator):
+            try:
+                entity = self.resolve(mention)
+                results.append(entity)
+                # Track new vs existing — if canonical_id is new this iteration
+                resolved += 1
+            except Exception as e:
+                log.warning("resolution_failed", mention=mention.text, error=str(e))
+                results.append(None)
+
+            # Every 100 mentions log a structured progress line
+            if (i + 1) % 100 == 0:
+                log.info(
+                    "entity_resolution_progress",
+                    done=i + 1,
+                    total=len(mentions),
+                    pct=round(100 * (i + 1) / len(mentions), 1),
+                )
+
+        return results
 
     def _update_entity(self, entity: CanonicalEntity, mention: EntityMention, normalized: str) -> CanonicalEntity:
         session = get_session()
