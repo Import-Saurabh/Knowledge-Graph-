@@ -187,6 +187,46 @@ CONTROLLED_VOCABULARY: Dict[str, List[str]] = {
 # Fast set for Stage 1 direct-canonical check
 SEED_SET: set = set(CONTROLLED_VOCABULARY.keys())
 
+DIRECT_RELATION_ALIASES: Dict[str, str] = {
+    "attacked": "MILITARY_ATTACK",
+    "attack": "MILITARY_ATTACK",
+    "targeted": "MILITARY_ATTACK",
+    "struck": "MILITARY_ATTACK",
+    "bombed": "MILITARY_ATTACK",
+    "invaded": "MILITARY_OCCUPATION",
+    "occupied": "MILITARY_OCCUPATION",
+    "controlled by": "MILITARY_OCCUPATION",
+    "allied with": "ALLY_OF",
+    "ally of": "ALLY_OF",
+    "supported by": "MILITARY_SUPPORT",
+    "supports": "MILITARY_SUPPORT",
+    "supplied weapons to": "MILITARY_SUPPORT",
+    "funded by": "ECONOMIC_AID",
+    "sanctioned by": "SANCTIONS_IMPOSED",
+    "sanctioned": "SANCTIONS_IMPOSED",
+    "accused": "ACCUSED_OF",
+    "accused of": "ACCUSED_OF",
+    "negotiated with": "PEACE_NEGOTIATION",
+    "signed agreement with": "DIPLOMATIC_AGREEMENT",
+    "leader of": "LEADER_OF",
+    "head of state of": "LEADER_OF",
+    "member of": "MEMBER_OF",
+    "part of": "MEMBER_OF",
+    "headquartered in": "HEADQUARTERED_IN",
+    "based in": "HEADQUARTERED_IN",
+    "located in": "HEADQUARTERED_IN",
+    "capital of": "CAPITAL_OF",
+    "occurred in": "OCCURRED_IN",
+    "citizen of": "CITIZEN_OF",
+    "participant in": "PARTICIPANT_IN",
+    "killed": "MILITARY_ATTACK",
+    "at war with": "OPPOSES",
+    "threatened": "OPPOSES",
+    "responded to": "DIPLOMATIC_STATEMENT",
+    "spokesperson of": "MEMBER_OF",
+    "founded by": "FOUNDED",
+}
+
 
 # ---------------------------------------------------------------------------
 # Manager
@@ -275,8 +315,14 @@ class RelationOntologyManager:
             log.debug("relation_normalized_direct", raw=relation_text, canonical=upper)
             return upper
 
+        cleaned = self._preprocess(relation_text)
+        alias_hit = DIRECT_RELATION_ALIASES.get(cleaned)
+        if alias_hit:
+            return self._persist_relation(
+                cleaned, None, relation_text, canonical=alias_hit
+            )
+
         # ── Embed ──────────────────────────────────────────────────────────
-        cleaned      = self._preprocess(relation_text)
         embedding_l: Optional[list]        = None
         embedding_np: Optional[np.ndarray] = None
         try:
@@ -495,8 +541,10 @@ class RelationOntologyManager:
             if existing:
                 existing.usage_count = (existing.usage_count or 0) + 1
                 existing.last_seen   = datetime.utcnow()
+                if canonical and existing.relation_canonical != canonical:
+                    existing.relation_canonical = canonical
                 session.commit()
-                return existing.relation_canonical or canonical
+                return canonical or existing.relation_canonical or "RELATED_TO"
         except Exception as e:
             log.warning("persist_relation_lookup_failed", error=str(e))
         finally:

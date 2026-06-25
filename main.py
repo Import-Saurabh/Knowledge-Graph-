@@ -399,10 +399,7 @@ def run_pipeline(args):
 
     try:
         relation_ontology = RelationOntologyManager(chroma, embedder)
-        # Pre-warm vocab embeddings so the first normalize_relation() call
-        # during graph building doesn't block on cold embedding computation.
-        relation_ontology.precompute_vocab_embeddings()
-        log.info("relation_ontology_ready")
+        log.info("relation_ontology_ready", mode="direct_glirel_label_map")
     except Exception as e:
         log.error("relation_ontology_init_failed", error=str(e))
 

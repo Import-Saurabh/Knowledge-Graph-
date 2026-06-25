@@ -113,6 +113,12 @@ class ChromaManager:
         except Exception as e:
             log.warning("chroma_upsert_entities_failed", count=len(ids), error=str(e))
 
+    def delete_entities(self, ids: List[str]):
+        try:
+            self.entity_collection.delete(ids=ids)
+        except Exception as e:
+            log.warning("chroma_delete_entities_failed", count=len(ids), error=str(e))
+
     def search_entities(
         self,
         query_embedding: List[float],

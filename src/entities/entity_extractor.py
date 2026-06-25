@@ -35,19 +35,19 @@ from src.models.entity import EntityMention
 from src.utils.config import settings
 from src.utils.logger import get_logger
 
-torch.set_num_threads(8)  # reduce inside extract_with_glirel during fan-out
+torch.set_num_threads(int(os.environ.get("NEWS_KG_TORCH_THREADS", "6")))
 
 log = get_logger(__name__)
 
-BATCH_SIZE           = 32
-CONFIDENCE_THRESHOLD = 0.4
+BATCH_SIZE           = 16
+CONFIDENCE_THRESHOLD = 0.45
 
 # ---------------------------------------------------------------------------
 # GLiNER / GLiREL shared configuration
 # ---------------------------------------------------------------------------
 
-MAX_ENTS  = 40   # cap entities per chunk fed to GLiREL
-MAX_WORDS = 400  # words per text chunk
+MAX_ENTS  = 24   # cap entities per chunk fed to GLiREL
+MAX_WORDS = 220  # words per text chunk
 
 # Entity types that add noise to relation pairs (dates, monetary values)
 RELATION_ENTITY_EXCLUDE = {"date", "money or economic value"}
@@ -212,7 +212,7 @@ class _RealGlirelExtractor:
     Use glirel_base for lower RAM/CPU cost, glirel-large-v0 for higher recall.
     """
 
-    MODEL_NAME = "jackboyla/glirel-large-v0"
+    MODEL_NAME = os.environ.get("GLIREL_MODEL", "jackboyla/glirel-large-v0")
 
     def __init__(self, model_name: Optional[str] = None):
         import inspect
@@ -268,11 +268,15 @@ class _RealGlirelExtractor:
 
         # Convert char offsets → token spans (GLiREL expects inclusive tok idx)
         ner = []
+        type_by_text: Dict[str, str] = {}
         for ent in gliner_ents:
             tok_span = _char_to_token_span(ent["start"], ent["end"], spans)
             if tok_span is None:
                 continue
-            ner.append([tok_span[0], tok_span[1], ent.get("label", "Unknown"), ent["text"]])
+            ent_type = str(ent.get("label", "Unknown")).lower()
+            ent_text = str(ent["text"]).strip()
+            ner.append([tok_span[0], tok_span[1], ent_type, ent_text])
+            type_by_text[ent_text.lower()] = ent_type
 
         if len(ner) < 2:
             return []
@@ -292,6 +296,10 @@ class _RealGlirelExtractor:
             label = r.get("label", "")
             score = float(r.get("score", 0.0))
             if not head or not tail or not label or head.lower() == tail.lower():
+                continue
+            head_type = type_by_text.get(head.lower(), "Unknown")
+            tail_type = type_by_text.get(tail.lower(), "Unknown")
+            if not _passes_constraint(head_type, tail_type, label):
                 continue
             out.append({"head": head, "tail": tail, "relation": label, "score": score})
         return out
@@ -315,9 +323,9 @@ class EntityExtractor:
         self,
         ontology_manager=None,
         use_glirel: bool = True,
-        glirel_threshold: float = 0.45,
+        glirel_threshold: float = 0.55,
         ner_threshold: float = CONFIDENCE_THRESHOLD,
-        glirel_workers: int = 4,
+        glirel_workers: int = 1,
     ):
         self.ontology         = ontology_manager
         self.use_glirel       = use_glirel
@@ -340,10 +348,9 @@ class EntityExtractor:
         if self._gliner_model is None:
             try:
                 from gliner import GLiNER
-                self._gliner_model = GLiNER.from_pretrained(
-                    "urchade/gliner_large-v2.1"
-                )
-                log.info("gliner_model_loaded", model="urchade/gliner_large-v2.1")
+                model_name = os.environ.get("GLINER_MODEL", "urchade/gliner_small-v2.1")
+                self._gliner_model = GLiNER.from_pretrained(model_name)
+                log.info("gliner_model_loaded", model=model_name)
             except Exception as e:
                 log.error("gliner_load_failed", error=str(e))
                 raise

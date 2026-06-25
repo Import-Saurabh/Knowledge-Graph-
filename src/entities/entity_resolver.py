@@ -15,6 +15,39 @@ log = get_logger(__name__)
 SIMILARITY_THRESHOLD = 0.88
 FUZZY_THRESHOLD = 85
 
+_TITLE_RE = re.compile(
+    r"^(?:former\s+|current\s+)?(?:president|prime minister|minister|secretary|"
+    r"dr|mr|mrs|ms|ceo|chairman|leader|commander)\.?\s+",
+    re.IGNORECASE,
+)
+_PUNCT_RE = re.compile(r"[^\w\s&-]")
+_SPACE_RE = re.compile(r"\s+")
+
+_KNOWN_ALIAS_KEYS = {
+    "donald j trump": "donald trump",
+    "donald john trump": "donald trump",
+    "president donald trump": "donald trump",
+    "president donald j trump": "donald trump",
+    "president trump": "donald trump",
+    "trump": "donald trump",
+    "trump trump": "donald trump",
+    "u s": "united states",
+    "us": "united states",
+    "usa": "united states",
+    "u s a": "united states",
+    "america": "united states",
+    "irgc": "islamic revolutionary guard corps",
+    "irgcs": "islamic revolutionary guard corps",
+    "islamic revolutionary guards corps": "islamic revolutionary guard corps",
+    "islamic revolution guard corps": "islamic revolutionary guard corps",
+    "islamic revolutionary guards": "islamic revolutionary guard corps",
+}
+
+_GENERIC_ROLE_KEYS = {
+    "president", "prime minister", "minister", "secretary", "leader",
+    "commander", "official", "spokesperson", "government", "military",
+}
+
 class EntityResolver:
     def __init__(self, chroma_manager, embedding_generator, wikidata_linker=None):
         self.chroma = chroma_manager
@@ -24,11 +57,44 @@ class EntityResolver:
         if wikidata_linker:
             log.info("wikidata_linker_attached_to_resolver")
 
+    @staticmethod
+    def canonical_key(text: str) -> str:
+        """Stable surface key used for alias matching and graph endpoints."""
+        value = (text or "").strip()
+        value = value.replace("’", "'").replace("`", "'")
+        value = re.sub(r"'s\b", "", value, flags=re.IGNORECASE)
+        value = _TITLE_RE.sub("", value)
+        value = _PUNCT_RE.sub(" ", value)
+        value = _SPACE_RE.sub(" ", value).strip().lower()
+
+        # Collapse accidental repeated tokens: "Trump Trump" -> "trump".
+        tokens = value.split()
+        collapsed = []
+        for token in tokens:
+            if not collapsed or collapsed[-1] != token:
+                collapsed.append(token)
+        value = " ".join(collapsed)
+
+        # Drop middle initials in person names: "donald j trump" -> "donald trump".
+        value = re.sub(r"\b([a-z]+)\s+[a-z]\s+([a-z]+)\b", r"\1 \2", value)
+        return _KNOWN_ALIAS_KEYS.get(value, value)
+
+    @staticmethod
+    def is_generic_role(text: str) -> bool:
+        return EntityResolver.canonical_key(text) in _GENERIC_ROLE_KEYS
+
     def _normalize(self, text: str) -> str:
-        text = text.strip()
-        text = re.sub(r"^(President|Dr\.|Mr\.|Mrs\.|Ms\.|CEO|Chairman|Secretary|Minister|Prime Minister|)", "", text, flags=re.IGNORECASE).strip()
-        text = re.sub(r"[.,;:!?]$", "", text)
-        return text.lower()
+        return self.canonical_key(text)
+
+    def _type_name_for_id(self, session, type_id: str | None) -> str:
+        if not type_id:
+            return "Unknown"
+        try:
+            from src.utils.db import EntityOntologyDB
+            row = session.query(EntityOntologyDB).filter_by(type_id=type_id).first()
+            return row.type_name if row else type_id
+        except Exception:
+            return type_id
 
     # ------------------------------------------------------------------
     # DUPLICATE-RESOLUTION FIX
@@ -100,6 +166,8 @@ class EntityResolver:
                 for name in names:
                     if not name:
                         continue
+                    if self.canonical_key(name) == normalized:
+                        return self._db_to_model(db)
                     if self._is_acronym_match(raw_text, name) or \
                        self._is_partial_name_match(normalized, name, entity_type):
                         return self._db_to_model(db)
@@ -139,6 +207,11 @@ class EntityResolver:
             aliases = json.loads(db.aliases) if db.aliases else []
         except:
             pass
+        session = get_session()
+        try:
+            type_name = self._type_name_for_id(session, db.type_id)
+        finally:
+            session.close()
         embedding = []
         if db.embedding_vector:
             try:
@@ -148,7 +221,7 @@ class EntityResolver:
         return CanonicalEntity(
             canonical_id=db.canonical_id,
             canonical_name=db.canonical_name,
-            entity_type=db.type_id or "Unknown",
+            entity_type=type_name,
             aliases=aliases,
             mention_count=db.mention_count,
             first_seen=db.first_seen,
@@ -197,6 +270,8 @@ class EntityResolver:
 
     def resolve(self, mention: EntityMention) -> CanonicalEntity:
         normalized = self._normalize(mention.text)
+        if self.is_generic_role(mention.text):
+            raise ValueError(f"generic role mention skipped: {mention.text}")
 
         # Pass 1: acronym / partial-name exact match (see block above) —
         # cheap and high-precision, so it short-circuits the rest.
@@ -342,12 +417,18 @@ class EntityResolver:
         canonical_name = mention.text.strip()
 
         # --- UPSERT GUARD ---
-        existing_db = session.query(CanonicalEntityDB).filter_by(canonical_name=canonical_name).first()
-        if existing_db:
-            session.close()
-            existing_entity = self._db_to_model(existing_db)
-            log.info("entity_exists_reusing", canonical_name=canonical_name)
-            return self._update_entity(existing_entity, mention, normalized)
+        rows = session.query(CanonicalEntityDB).all()
+        for existing_db in rows:
+            names = [existing_db.canonical_name]
+            try:
+                names += json.loads(existing_db.aliases) if existing_db.aliases else []
+            except Exception:
+                pass
+            if any(self.canonical_key(name) == normalized for name in names):
+                session.close()
+                existing_entity = self._db_to_model(existing_db)
+                log.info("entity_exists_reusing", canonical_name=existing_db.canonical_name)
+                return self._update_entity(existing_entity, mention, normalized)
 
         canonical_id = str(uuid.uuid4())
 
@@ -472,39 +553,71 @@ class EntityResolver:
             merged_away: set = set()
             merge_count = 0
 
-            for i, row_a in enumerate(rows):
-                if row_a.canonical_id in merged_away:
-                    continue
-                names_a = [row_a.canonical_name]
+            key_owner: dict[str, CanonicalEntityDB] = {}
+            acronym_owner: dict[str, CanonicalEntityDB] = {}
+
+            def names_for(row):
+                names = [row.canonical_name]
                 try:
-                    names_a += json.loads(row_a.aliases) if row_a.aliases else []
+                    names += json.loads(row.aliases) if row.aliases else []
                 except Exception:
                     pass
-                type_a = type_name_by_id.get(row_a.type_id, "")
+                return [n for n in names if n]
 
-                for row_b in rows[i + 1:]:
-                    if row_b.canonical_id in merged_away or row_b.canonical_id == row_a.canonical_id:
-                        continue
-                    type_b = type_name_by_id.get(row_b.type_id, "")
-                    norm_b = self._normalize(row_b.canonical_name)
-                    is_dup = any(
-                        self._is_acronym_match(row_b.canonical_name, name_a) or
-                        self._is_acronym_match(name_a, row_b.canonical_name) or
-                        self._is_partial_name_match(norm_b, name_a, type_b) or
-                        self._is_partial_name_match(self._normalize(name_a), row_b.canonical_name, type_a)
-                        for name_a in names_a
+            def acronym_for(name: str) -> str:
+                words = re.findall(r"[A-Za-z]+", name or "")
+                if len(words) < 2:
+                    return ""
+                return "".join(w[0] for w in words).upper()
+
+            for row in rows:
+                if row.canonical_id in merged_away:
+                    continue
+                row_type = type_name_by_id.get(row.type_id, "")
+                keys = {
+                    self.canonical_key(name)
+                    for name in names_for(row)
+                    if name and not self.is_generic_role(name)
+                }
+                keys = {k for k in keys if k and len(k) > 1}
+
+                survivor = None
+                for key in keys:
+                    if key in key_owner and key_owner[key].canonical_id != row.canonical_id:
+                        survivor = key_owner[key]
+                        break
+
+                if survivor is None:
+                    for name in names_for(row):
+                        token = name.strip()
+                        if 2 <= len(token) <= 8 and token.isalpha() and token.isupper():
+                            survivor = acronym_owner.get(token.upper())
+                            if survivor is not None:
+                                break
+
+                if survivor is not None:
+                    survivor_type = type_name_by_id.get(survivor.type_id, "")
+                    compatible = (
+                        not row_type or not survivor_type or row_type == survivor_type
+                        or {row_type, survivor_type} <= {"person", "job title or role"}
                     )
-                    if not is_dup:
+                    if compatible:
+                        self._merge_rows(session, survivor=survivor, loser=row)
+                        merged_away.add(row.canonical_id)
+                        merge_count += 1
+                        log.info(
+                            "duplicate_entities_merged",
+                            survivor=survivor.canonical_name,
+                            loser=row.canonical_name,
+                        )
                         continue
 
-                    self._merge_rows(session, survivor=row_a, loser=row_b)
-                    merged_away.add(row_b.canonical_id)
-                    merge_count += 1
-                    log.info(
-                        "duplicate_entities_merged",
-                        survivor=row_a.canonical_name,
-                        loser=row_b.canonical_name,
-                    )
+                for key in keys:
+                    key_owner.setdefault(key, row)
+                for name in names_for(row):
+                    acro = acronym_for(name)
+                    if acro:
+                        acronym_owner.setdefault(acro, row)
 
             session.commit()
         except Exception as e:

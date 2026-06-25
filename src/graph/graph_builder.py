@@ -24,9 +24,11 @@ after graph construction. Event nodes are always kept.
 import re
 import networkx as nx
 from typing import List, Dict, Optional, Tuple
+from rapidfuzz import fuzz
 
 from src.models.event import EventModel
 from src.models.entity import CanonicalEntity
+from src.entities.entity_resolver import EntityResolver
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -54,7 +56,7 @@ def _is_junk_node(node_id: str, data: Dict) -> bool:
 
 class GraphBuilder:
     GLIREL_SCORE_THRESHOLD: float = 0.50
-    MIN_NODE_DEGREE:        int   = 2
+    MIN_NODE_DEGREE:        int   = 1
 
     def __init__(self):
         self.graph = nx.DiGraph()
@@ -129,8 +131,14 @@ class GraphBuilder:
             # Upgrade confidence to the higher of the two scores
             if score > existing.get("confidence", 0.0):
                 existing["confidence"] = score
+                existing["relation"] = relation
+                existing["original_relation"] = original_relation or relation
             existing["glirel_confirmed"] = True
-            existing.setdefault("glirel_score", score)
+            existing["glirel_score"] = max(float(existing.get("glirel_score", 0.0)), score)
+            articles = set(filter(None, str(existing.get("article_id", "")).split(";")))
+            if article_id:
+                articles.add(article_id)
+            existing["article_id"] = ";".join(sorted(articles))
             return
         self.graph.add_edge(
             head_id, tail_id,
@@ -142,6 +150,35 @@ class GraphBuilder:
             glirel_confirmed=True,
             glirel_score=score,
         )
+
+    @staticmethod
+    def _normalize_endpoint(text: str) -> str:
+        return EntityResolver.canonical_key(text)
+
+    @staticmethod
+    def _is_bad_endpoint(text: str) -> bool:
+        key = EntityResolver.canonical_key(text)
+        if EntityResolver.is_generic_role(text):
+            return True
+        return len(key) <= 1 or key in {"he", "she", "they", "it", "them", "his", "her"}
+
+    def _resolve_endpoint(self, raw: str, name_to_id: Dict[str, str]) -> Optional[str]:
+        key = self._normalize_endpoint(raw)
+        if not key:
+            return None
+        if key in name_to_id:
+            return name_to_id[key]
+
+        # Conservative fuzzy fallback for cached triples whose surface form
+        # differs slightly from the resolved alias table.
+        best_id = None
+        best_score = 0
+        for candidate, entity_id in name_to_id.items():
+            score = fuzz.token_set_ratio(key, candidate)
+            if score > best_score:
+                best_score = score
+                best_id = entity_id
+        return best_id if best_score >= 92 else None
 
     # ------------------------------------------------------------------
     # Main builder
@@ -176,9 +213,9 @@ class GraphBuilder:
         name_to_id: Dict[str, str] = {}
         if entity_map:
             for entity in entity_map.values():
-                name_to_id[entity.canonical_name.lower()] = entity.canonical_id
+                name_to_id[self._normalize_endpoint(entity.canonical_name)] = entity.canonical_id
                 for alias in (entity.aliases or []):
-                    name_to_id[alias.lower()] = entity.canonical_id
+                    name_to_id[self._normalize_endpoint(alias)] = entity.canonical_id
 
         # ── Event nodes (from cluster metadata) ─────────────────────────────
         for event in events:
@@ -214,6 +251,9 @@ class GraphBuilder:
                     continue
                 if head_raw.lower() == tail_raw.lower():
                     continue
+                if self._is_bad_endpoint(head_raw) or self._is_bad_endpoint(tail_raw):
+                    glirel_dropped += 1
+                    continue
                 if score < self.GLIREL_SCORE_THRESHOLD:
                     glirel_dropped += 1
                     continue
@@ -227,10 +267,11 @@ class GraphBuilder:
                 else:
                     relation_canonical = relation_raw
 
-                head_id = name_to_id.get(head_raw.lower(), head_raw)
-                tail_id = name_to_id.get(tail_raw.lower(), tail_raw)
-                self._ensure_entity_stub(head_id, head_raw)
-                self._ensure_entity_stub(tail_id, tail_raw)
+                head_id = self._resolve_endpoint(head_raw, name_to_id)
+                tail_id = self._resolve_endpoint(tail_raw, name_to_id)
+                if not head_id or not tail_id or head_id == tail_id:
+                    glirel_dropped += 1
+                    continue
 
                 existed = self.graph.has_edge(head_id, tail_id)
                 self._add_glirel_edge(
@@ -254,8 +295,10 @@ class GraphBuilder:
         if infobox_triples:
             infobox_added = 0
             for subject, relation, obj in infobox_triples:
-                subj_id = name_to_id.get(subject.lower(), subject)
-                obj_id  = name_to_id.get(obj.lower(), obj)
+                if self._is_bad_endpoint(subject) or self._is_bad_endpoint(obj):
+                    continue
+                subj_id = self._resolve_endpoint(subject, name_to_id) or subject
+                obj_id  = self._resolve_endpoint(obj, name_to_id) or obj
                 self._ensure_entity_stub(subj_id, subject)
                 self._ensure_entity_stub(obj_id, obj)
                 if not self.graph.has_edge(subj_id, obj_id):

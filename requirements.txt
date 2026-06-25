@@ -11,7 +11,8 @@ chromadb>=0.5
 
 # NLP / NER
 gliner>=0.2
-spacy>=3.7
+glirel>=0.1
+huggingface_hub>=0.24.6
 rapidfuzz>=3.0
 
 # Embeddings
@@ -26,11 +27,6 @@ numpy>=1.26
 # Graph
 networkx>=3.0
 pyvis>=0.3
-
-# LLM clients (pick the one you use)
-anthropic>=0.30
-openai>=1.40
-groq>=0.9
 
 # News Download
 gnews>=0.3.5
