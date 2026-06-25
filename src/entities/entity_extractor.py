@@ -1,38 +1,25 @@
 """
 src/entities/entity_extractor.py
 
-GLiREL RESTORED (real model), with a GLiNER-based fallback.
+GLiNER for named-entity recognition.
+GLiREL (jackboyla/glirel-large-v0) for relation extraction.
 
-History
-  • GLiREL was previously removed because `GLiREL.from_pretrained()` crashed
-    with `TypeError: ..._from_pretrained() missing 2 required keyword-only
-    arguments: 'proxies' and 'resume_download'`. That's a version mismatch
-    between `glirel` and `huggingface_hub` (newer hub releases stopped
-    forwarding those kwargs), not a problem with GLiREL itself — fix it with
-    `pip install "huggingface_hub==0.24.6" glirel --break-system-packages`.
-  • The GLiNER-as-relation-classifier replacement that took GLiREL's place
-    also had a hard bug: every call site passed a *list* of texts into
-    `GLiNER.predict_entities()`, which only accepts a single string. The
-    exception was swallowed, so relation extraction always silently
-    returned 0 triples. Fixed via `_batch_predict()` below, which uses the
-    real `batch_predict_entities()` API.
+No spaCy. No LLM. No GLiNER-as-relation-classifier fallback.
 
-Current design
-  • `_load_glirel()` tries to load real GLiREL (`jackboyla/glirel_base`) on
-    first use. If that succeeds, `_RealGlirelExtractor` does genuine
-    zero-shot relation extraction using the SAME GLiNER entities already
-    extracted for NER (converted from character spans to token spans via
-    `_tokenize`/`_char_to_token_span`).
-  • If GLiREL can't load in this environment, `extract_with_glirel()` falls
-    back to `_GliNERRelationExtractor`, the GLiNER-as-relation-classifier
-    workaround — now with its batching bug fixed, but still a lower-recall
-    approximation since it isn't a trained relation-classification model.
-  • Same public interface either way:
-      extract_with_glirel(articles) -> List[dict]   (key name kept for
-      compatibility so main.py needs no changes)
+If GLiREL cannot load (network down, model not cached), extract_with_glirel()
+returns an empty list and logs a clear error — it does NOT fall back to a
+degraded approximation. Fix the environment and rerun.
 
-All other behaviour (GLiNER NER, spaCy fallback, chunking, CONSTRAINTS,
-_add_relation dedup) is unchanged.
+Design
+------
+  • GLiNER (urchade/gliner_large-v2.1) is loaded once and reused for both
+    NER and as the entity-span source for GLiREL.
+  • GLiREL receives token-index spans converted from GLiNER's character offsets
+    via _tokenize / _char_to_token_span.
+  • Relation scoring is fanned across up to `glirel_workers` threads so
+    otherwise-idle CPU cores are used during the forward pass.
+  • Entity types in RELATION_ENTITY_EXCLUDE are stripped before RE to avoid
+    noisy date/money pairs being scored.
 """
 
 import os
@@ -40,7 +27,6 @@ import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from itertools import combinations
 from typing import List, Dict, Optional, Tuple, Any
 
 import torch
@@ -49,40 +35,38 @@ from src.models.entity import EntityMention
 from src.utils.config import settings
 from src.utils.logger import get_logger
 
-# Set CPU threads for optimal performance. This is the baseline used for
-# single-threaded calls (the batched GLiNER NER pass). It's temporarily
-# reduced inside extract_with_glirel() while GLiREL scoring fans out across
-# worker threads, so we don't oversubscribe the CPU.
-torch.set_num_threads(8)  # adjust based on your CPU cores
+torch.set_num_threads(8)  # reduce inside extract_with_glirel during fan-out
 
 log = get_logger(__name__)
 
-BATCH_SIZE = 32
+BATCH_SIZE           = 32
 CONFIDENCE_THRESHOLD = 0.4
 
 # ---------------------------------------------------------------------------
-# GLiNER-2 RE configuration
+# GLiNER / GLiREL shared configuration
 # ---------------------------------------------------------------------------
 
-MAX_ENTS = 40          # cap entities per chunk
-MAX_WORDS = 400        # increased from 200 to reduce chunk count
+MAX_ENTS  = 40   # cap entities per chunk fed to GLiREL
+MAX_WORDS = 400  # words per text chunk
+
+# Entity types that add noise to relation pairs (dates, monetary values)
 RELATION_ENTITY_EXCLUDE = {"date", "money or economic value"}
 
 TOKEN_RE = re.compile(r"\w+(?:[-_]\w+)*|\S")
 
-# Logical actor / location / thing groups used in CONSTRAINTS
-_PER = {"person"}
-_ROLE = {"job title or role"}
+# Entity type groups used in CONSTRAINTS
+_PER    = {"person"}
+_ROLE   = {"job title or role"}
 _NATION = {"country", "geopolitical entity"}
-_ORG = {"organization", "government agency", "military unit", "political group"}
-_PLACE = {"country", "city", "location", "geopolitical entity", "facility"}
-_ARMS = {"weapon", "military operation", "vehicle or aircraft"}
-_EVENT = {"event", "military operation"}
-_ACTOR = _PER | _ORG | _NATION
+_ORG    = {"organization", "government agency", "military unit", "political group"}
+_PLACE  = {"country", "city", "location", "geopolitical entity", "facility"}
+_ARMS   = {"weapon", "military operation", "vehicle or aircraft"}
+_EVENT  = {"event", "military operation"}
+_ACTOR  = _PER | _ORG | _NATION
 _HITTABLE = _PLACE | _ORG | _PER | _ARMS
 
-# Relation labels we want to detect — same list as before
-RELATION_LABELS = [
+# Relation labels for GLiREL — closed-set geopolitical/military vocabulary
+RELATION_LABELS: List[str] = [
     "allied with", "at war with", "attacked", "invaded", "located in",
     "capital of", "part of", "member of", "leader of", "head of state of",
     "headquartered in", "supported by", "funded by", "sanctioned by",
@@ -125,6 +109,10 @@ RELATION_CONSTRAINTS: Dict[str, Tuple[set, set]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Token-level helpers (needed to convert GLiNER char spans → GLiREL tok spans)
+# ---------------------------------------------------------------------------
+
 def _tokenize(text: str) -> Tuple[List[str], List[Tuple[int, int]]]:
     toks, spans = [], []
     for m in TOKEN_RE.finditer(text):
@@ -145,7 +133,7 @@ def _char_to_token_span(
     return (first, last) if first is not None else None
 
 
-def _add_relation(relations: dict, head: str, label: str, tail: str, score: float):
+def _add_relation(relations: dict, head: str, label: str, tail: str, score: float) -> None:
     """Keep one directed edge per unordered (head, label, tail) — higher score wins."""
     rev = (tail, label, head)
     if rev in relations:
@@ -170,17 +158,8 @@ def _batch_predict(
     model, texts: List[str], labels: List[str], threshold: float
 ) -> List[List[dict]]:
     """
-    BUG FIX: `GLiNER.predict_entities()` only accepts a SINGLE string as its
-    first argument. Every call-site in this file used to pass a *list* of
-    texts straight into `predict_entities()` (e.g. `predict_entities(probes,
-    RELATION_LABELS, ...)` and `predict_entities(chunk_texts, labels, ...)`).
-    That raises inside the model on every call, which was silently caught by
-    a wrapping try/except and turned into an empty result — the root cause
-    of GLiREL/relation-extraction always returning 0 triples.
-
-    GLiNER's real batch API is `batch_predict_entities(texts, labels,
-    threshold=...)`. We prefer it when present and fall back to looping the
-    single-text API for older `gliner` versions that don't expose it.
+    GLiNER batch helper. Uses batch_predict_entities() when available,
+    otherwise loops predict_entities() per text.
     """
     if hasattr(model, "batch_predict_entities"):
         return model.batch_predict_entities(texts, labels, threshold=threshold)
@@ -189,11 +168,8 @@ def _batch_predict(
 
 def _progress(iterable, total: Optional[int] = None, desc: str = ""):
     """
-    Iterate over `iterable`, showing a tqdm progress bar if tqdm is
-    installed, otherwise falling back to periodic structured log lines
-    (~20 updates over the run, with elapsed/ETA) so progress is visible
-    either way. This is what was missing before — the GLiREL scoring loop
-    used to run silently for however long it took with no feedback at all.
+    Yield items from iterable with a tqdm progress bar when available,
+    or periodic structured log lines (~20 updates) otherwise.
     """
     try:
         from tqdm import tqdm as _tqdm
@@ -221,140 +197,31 @@ def _progress(iterable, total: Optional[int] = None, desc: str = ""):
 
 
 # ---------------------------------------------------------------------------
-# GLiNER-2 relation extractor (replaces GLiREL) — now with batched scoring
+# Real GLiREL relation extractor
 # ---------------------------------------------------------------------------
-
-class _GliNERRelationExtractor:
-    """
-    Uses GLiNER-2 to score entity-pair relations.
-
-    Strategy:
-      1. Extract named entities from a text chunk with GLiNER.
-      2. For each ordered entity pair (head, tail) whose types pass the
-         constraint filter, build a synthetic prompt:
-             "<head_text> [RELATION] <tail_text>"
-         and ask GLiNER to score it against each relation label.
-      3. Keep the highest-scoring label above threshold.
-
-    This avoids any dependency on GLiREL while reusing the already-loaded
-    GLiNER model.  Scoring is batched across many pairs for efficiency.
-    """
-
-    def __init__(self, gliner_model, threshold: float = 0.45):
-        self.model = gliner_model
-        self.threshold = threshold
-
-    def score_pairs_batch(
-        self,
-        pairs: List[Tuple[str, str, str, str]],  # (head_text, tail_text, head_type, tail_type)
-        batch_size: int = 256,
-    ) -> List[Optional[Dict[str, Any]]]:
-        """
-        Score a list of entity pairs against all relation labels in one batched GLiNER call.
-
-        Returns a list of dicts (or None) with keys:
-            head_text, tail_text, head_type, tail_type, label, score
-        """
-        if not pairs:
-            return []
-
-        results = [None] * len(pairs)
-        # Batch to avoid OOM
-        for start in range(0, len(pairs), batch_size):
-            batch = pairs[start:start+batch_size]
-            probes = [f"{h} [and] {t}" for h, t, _, _ in batch]
-            try:
-                # BUG FIX: was `self.model.predict_entities(probes, ...)` —
-                # predict_entities() only takes ONE string; passing a list
-                # raised on every call and was swallowed below, so this path
-                # always returned zero relations. Use the batch-safe helper.
-                all_scores = _batch_predict(self.model, probes, RELATION_LABELS, 0.0)
-            except Exception as e:
-                log.warning("gliner_batch_re_failed", error=str(e))
-                continue
-
-            for idx_in_batch, (probe, scores_for_probe, pair) in enumerate(
-                zip(probes, all_scores, batch)
-            ):
-                h, t, htype, ttype = pair
-                # Find allowed relations
-                allowed = [
-                    lbl for lbl in RELATION_LABELS
-                    if _passes_constraint(htype, ttype, lbl)
-                ]
-                best_label = None
-                best_score = self.threshold
-                for item in scores_for_probe:
-                    if item["label"] in allowed and item["score"] > best_score:
-                        best_score = item["score"]
-                        best_label = item["label"]
-                if best_label is not None:
-                    results[start + idx_in_batch] = {
-                        "head_text": h,
-                        "tail_text": t,
-                        "head_type": htype,
-                        "tail_type": ttype,
-                        "label": best_label,
-                        "score": best_score,
-                    }
-        return results
-
-
-# ---------------------------------------------------------------------------
-# Real GLiREL relation extractor (jackboyla/GLiREL)
-# ---------------------------------------------------------------------------
-#
-# This is the GENUINE GLiREL model, not the GLiNER-as-relation-classifier
-# workaround above. It was previously removed because `GLiREL.from_pretrained()`
-# crashed with:
-#
-#   TypeError: GLiREL._from_pretrained() missing 2 required keyword-only
-#   arguments: 'proxies' and 'resume_download'
-#
-# That is a version-mismatch bug between `glirel` and `huggingface_hub`, NOT
-# a problem with GLiREL itself: newer `huggingface_hub` releases dropped
-# `proxies`/`resume_download` from the kwargs they forward through
-# `ModelHubMixin.from_pretrained()`, but `glirel`'s vendored hub-mixin code
-# still declares them as required. Fix the environment, don't avoid the
-# library:
-#
-#       pip install "huggingface_hub==0.24.6" glirel --break-system-packages
-#
-# (0.23.x/0.25.x also work — anything before the kwarg was dropped). We still
-# guard the import/load with try/except below so the pipeline degrades to
-# the GLiNER fallback instead of crashing if that pin isn't in place yet.
-#
-# GLiREL needs token-index entity spans (`[start_tok, end_tok_inclusive,
-# type, text]`) rather than character offsets. We reuse the already-loaded
-# GLiNER entities (richer domain types than a generic spaCy NER pass would
-# give us) and convert their character spans to token spans with the
-# `_tokenize` / `_char_to_token_span` helpers defined above.
 
 class _RealGlirelExtractor:
-    """Thin wrapper around `glirel.GLiREL` (Boylan et al., 2025)."""
+    """
+    Thin wrapper around glirel.GLiREL (Boylan et al., 2025).
 
-    # "jackboyla/glirel_base" is the lighter model — appropriate for CPU-only
-    # machines. Swap in "jackboyla/glirel-large-v0" for higher accuracy if
-    # you have the RAM/CPU budget to spare.
+    Requires: pip install "huggingface_hub==0.24.6" glirel --break-system-packages
+    (newer huggingface_hub dropped the proxies/resume_download kwargs that
+    glirel's _from_pretrained still declares as required — the shim below
+    patches them in at runtime so any hub version works).
+
+    Use glirel_base for lower RAM/CPU cost, glirel-large-v0 for higher recall.
+    """
+
     MODEL_NAME = "jackboyla/glirel-large-v0"
 
     def __init__(self, model_name: Optional[str] = None):
         import inspect
-        from glirel import GLiREL  # raises ImportError if `glirel` isn't installed
+        from glirel import GLiREL
 
-        # ------------------------------------------------------------------ #
-        # FIX: huggingface_hub ≥ 0.25 stopped forwarding `proxies` and       #
-        # `resume_download` through ModelHubMixin.from_pretrained(), but      #
-        # glirel's _from_pretrained() still declares them as *required*       #
-        # keyword-only args → TypeError every time.                           #
-        #                                                                     #
-        # We inspect the live signature and, if those params are present and  #
-        # have no default, wrap _from_pretrained with a shim that injects     #
-        # safe defaults so the call succeeds with any hub version.            #
-        # ------------------------------------------------------------------ #
+        # Patch missing kwargs for newer huggingface_hub versions
         try:
             raw = GLiREL._from_pretrained
-            fn = raw.__func__ if hasattr(raw, "__func__") else raw
+            fn  = raw.__func__ if hasattr(raw, "__func__") else raw
             sig = inspect.signature(fn)
             params = sig.parameters
             needs_patch = any(
@@ -362,7 +229,7 @@ class _RealGlirelExtractor:
                 for name in ("proxies", "resume_download")
             )
             if needs_patch:
-                _orig_fn = fn  # capture
+                _orig_fn = fn
 
                 @classmethod  # type: ignore[misc]
                 def _patched(cls, *args, proxies=None, resume_download=False, **kwargs):
@@ -375,7 +242,7 @@ class _RealGlirelExtractor:
 
                 GLiREL._from_pretrained = _patched  # type: ignore[method-assign]
         except Exception:
-            pass  # if inspection itself fails, just let from_pretrained try and error naturally
+            pass
 
         self.model = GLiREL.from_pretrained(model_name or self.MODEL_NAME)
 
@@ -387,8 +254,10 @@ class _RealGlirelExtractor:
         threshold: float,
     ) -> List[Dict[str, Any]]:
         """
-        gliner_ents: GLiNER entity dicts with character-offset 'start'/'end'.
-        Returns a list of {head, tail, relation, score} dicts.
+        Score relations between all entity pairs in one text chunk.
+
+        gliner_ents — GLiNER entity dicts with character-offset 'start'/'end'.
+        Returns [{head, tail, relation, score}, ...] above threshold.
         """
         if len(gliner_ents) < 2:
             return []
@@ -397,14 +266,12 @@ class _RealGlirelExtractor:
         if not tokens:
             return []
 
+        # Convert char offsets → token spans (GLiREL expects inclusive tok idx)
         ner = []
         for ent in gliner_ents:
             tok_span = _char_to_token_span(ent["start"], ent["end"], spans)
             if tok_span is None:
                 continue
-            # GLiREL's end index is INCLUSIVE — unlike spaCy/GLiNER's
-            # exclusive convention — so we keep tok_span as-is (it's already
-            # the inclusive (first_token_idx, last_token_idx) pair).
             ner.append([tok_span[0], tok_span[1], ent.get("label", "Unknown"), ent["text"]])
 
         if len(ner) < 2:
@@ -420,8 +287,8 @@ class _RealGlirelExtractor:
 
         out: List[Dict[str, Any]] = []
         for r in relations:
-            head = " ".join(r.get("head_text") or []).strip()
-            tail = " ".join(r.get("tail_text") or []).strip()
+            head  = " ".join(r.get("head_text") or []).strip()
+            tail  = " ".join(r.get("tail_text") or []).strip()
             label = r.get("label", "")
             score = float(r.get("score", 0.0))
             if not head or not tail or not label or head.lower() == tail.lower():
@@ -435,31 +302,35 @@ class _RealGlirelExtractor:
 # ---------------------------------------------------------------------------
 
 class EntityExtractor:
+    """
+    Two-stage extractor:
+      1. GLiNER NER  — extract named entities from each article.
+      2. GLiREL RE   — score relations between discovered entity pairs.
+
+    No spaCy. No LLM. If GLiREL is unavailable, relation extraction returns
+    an empty list (no degraded fallback).
+    """
+
     def __init__(
         self,
-        use_spacy_fallback: bool = False,
         ontology_manager=None,
         use_glirel: bool = True,
         glirel_threshold: float = 0.45,
         ner_threshold: float = CONFIDENCE_THRESHOLD,
         glirel_workers: int = 4,
     ):
-        self.ontology = ontology_manager
-        self.use_spacy_fallback = use_spacy_fallback
-        self.use_glirel = use_glirel
+        self.ontology         = ontology_manager
+        self.use_glirel       = use_glirel
         self.glirel_threshold = glirel_threshold
-        self.ner_threshold = ner_threshold
-        # Worker threads for the GLiREL scoring fan-out (see
-        # extract_with_glirel). Your i5-1240P is 4 P-cores + 8 E-cores —
-        # 4 workers x ~2-3 intra-op threads each is a sane starting point.
-        # Set glirel_workers=1 to fall back to the original fully
-        # sequential behavior if you ever hit weirdness under concurrency.
-        self.glirel_workers = max(1, glirel_workers)
-        self._gliner_model = None
-        self._re_extractor: Optional[_GliNERRelationExtractor] = None
-        self._spacy_nlp = None
+        self.ner_threshold    = ner_threshold
+        # i5-1240P: 4 P-cores + 8 E-cores — 4 workers × ~2-3 intra-op threads
+        # each is a good starting point. Set glirel_workers=1 if you hit
+        # weirdness under concurrency.
+        self.glirel_workers   = max(1, glirel_workers)
+
+        self._gliner_model: Optional[object]            = None
         self._glirel_model: Optional[_RealGlirelExtractor] = None
-        self._glirel_unavailable = False
+        self._glirel_unavailable: bool                  = False
 
     # ------------------------------------------------------------------
     # Model loaders
@@ -478,36 +349,22 @@ class EntityExtractor:
                 raise
         return self._gliner_model
 
-    def _load_relation_extractor(self) -> _GliNERRelationExtractor:
-        if self._re_extractor is None:
-            model = self._load_gliner()
-            self._re_extractor = _GliNERRelationExtractor(
-                gliner_model=model,
-                threshold=self.glirel_threshold,
-            )
-            log.info(
-                "gliner_re_loaded",
-                model="urchade/gliner_large-v2.1",
-                threshold=self.glirel_threshold,
-            )
-        return self._re_extractor
-
     def _load_glirel(self) -> Optional[_RealGlirelExtractor]:
         """
-        Lazily load the real GLiREL model. Returns None (logging once) if it
-        can't load, so callers fall back to the GLiNER-based pseudo-RE path
-        instead of crashing the whole pipeline.
+        Lazily load GLiREL. Returns None (logged once) if unavailable —
+        caller should return empty results rather than running a fallback.
+
+        Load order:
+          1. Local HF cache (HF_HUB_OFFLINE=1 — no network ping).
+          2. Network download, up to 3 retries with back-off.
         """
         if self._glirel_unavailable:
             return None
         if self._glirel_model is not None:
             return self._glirel_model
 
-        # 1) Try local cache only, zero network calls. GLiREL.from_pretrained()
-        # normally does a HEAD request to huggingface.co even when the model
-        # is already fully cached — a transient DNS/Wi-Fi blip during that
-        # check kills the whole load even though the files are on disk.
-        # HF_HUB_OFFLINE=1 skips that check and reads straight from cache.
+        # 1) Try local cache first — avoids failing on a transient DNS blip
+        #    when the model is already fully downloaded.
         prev_offline = os.environ.get("HF_HUB_OFFLINE")
         os.environ["HF_HUB_OFFLINE"] = "1"
         try:
@@ -519,16 +376,14 @@ class EntityExtractor:
             )
             return self._glirel_model
         except Exception:
-            pass  # not cached (or cache incomplete) — fall through to a real load
+            pass  # not cached — fall through to network load
         finally:
             if prev_offline is None:
                 os.environ.pop("HF_HUB_OFFLINE", None)
             else:
                 os.environ["HF_HUB_OFFLINE"] = prev_offline
 
-        # 2) Not cached — do a real network load, retrying a few times in
-        # case it's just a transient blip (a DNS resolution failure mid-run
-        # usually means a brief connectivity drop, not a permanent problem).
+        # 2) Network load with retries
         last_err: Optional[Exception] = None
         for attempt in range(1, 4):
             try:
@@ -548,49 +403,29 @@ class EntityExtractor:
 
         self._glirel_unavailable = True
         err_str = str(last_err)
-        is_network_error = any(
+        is_network = any(
             s in err_str for s in (
                 "getaddrinfo failed", "NameResolutionError", "ConnectionError",
                 "Max retries exceeded", "NewConnectionError", "ConnectTimeout",
-                "ProxyError",
             )
         )
-        if is_network_error:
+        if is_network:
             hint = (
-                "Real GLiREL failed to load because of a network/DNS error "
-                "reaching huggingface.co — NOT a version mismatch. "
-                "'jackboyla/glirel_base' isn't fully cached locally yet, so "
-                "it needs a successful download at least once. Check your "
-                "connection and rerun; after one successful download it'll "
-                "load from local cache and won't need network again. "
-                "Falling back to the degraded GLiNER-based relation "
-                "classifier for this run."
+                "GLiREL failed to load due to a network/DNS error. "
+                "The model is not yet cached locally — run once with a stable "
+                "connection to download it, then it will load offline. "
+                "Relation extraction disabled for this run."
             )
         else:
             hint = (
-                "Real GLiREL failed to load. The proxies/resume_download "
-                "patch is already applied in code, so this is likely a "
-                "different error (model file corrupt/missing, OOM, or "
-                "glirel not installed). Try: pip install glirel "
-                "--break-system-packages  and rerun. If it worked once "
-                "before, delete the cached model dir "
-                "(~/.cache/huggingface/hub/models--jackboyla--glirel_base) "
-                "and let it re-download. Falling back to the degraded "
-                "GLiNER-based relation classifier for this run."
+                "GLiREL failed to load. Check: (1) glirel is installed "
+                "(pip install glirel --break-system-packages), "
+                "(2) huggingface_hub==0.24.6 is pinned, "
+                "(3) the local cache isn't corrupted. "
+                "Relation extraction disabled for this run."
             )
-        log.warning("glirel_load_failed_using_fallback", error=err_str, hint=hint)
+        log.error("glirel_load_failed", error=err_str, hint=hint)
         return None
-
-    def _load_spacy(self):
-        if self._spacy_nlp is None:
-            try:
-                import spacy
-                self._spacy_nlp = spacy.load("en_core_web_sm")
-                log.info("spacy_model_loaded")
-            except Exception as e:
-                log.error("spacy_load_failed", error=str(e))
-                raise
-        return self._spacy_nlp
 
     # ------------------------------------------------------------------
     # Label helpers
@@ -609,54 +444,47 @@ class EntityExtractor:
         ]
 
     # ------------------------------------------------------------------
-    # Public extraction API
+    # Public NER API
     # ------------------------------------------------------------------
 
     def extract_batch(
         self, articles: List[ArticleModel]
     ) -> List[List[EntityMention]]:
-        if self.use_spacy_fallback:
-            return [self._extract_spacy(a) for a in articles]
+        """Run GLiNER NER over a batch of articles."""
         try:
             return self._extract_gliner_batch(articles)
         except Exception as e:
-            log.warning("gliner_extraction_failed", error=str(e))
-            if self.use_spacy_fallback:
-                return [self._extract_spacy(a) for a in articles]
+            log.error("gliner_extraction_failed", error=str(e))
             raise
 
     def extract_single(self, article: ArticleModel) -> List[EntityMention]:
-        if self.use_spacy_fallback:
-            return self._extract_spacy(article)
+        """Run GLiNER NER on a single article."""
         try:
             return self._extract_gliner_batch([article])[0]
         except Exception as e:
             log.warning("gliner_single_failed", error=str(e))
-            if self.use_spacy_fallback:
-                return self._extract_spacy(article)
             return []
+
+    # ------------------------------------------------------------------
+    # Public RE API
+    # ------------------------------------------------------------------
 
     def extract_with_glirel(
         self, articles: List[ArticleModel]
     ) -> List[Dict]:
         """
-        Run GLiNER NER, then relation extraction over the discovered entity
-        pairs. Public signature kept identical to the original GLiREL-based
-        version so main.py requires zero changes. Returns a flat list of
-        relation dicts: {head, relation, tail, score, article_id}
+        Run GLiNER NER then GLiREL relation extraction over the entity pairs.
 
-        Relation-extraction backend (tried in order):
-          1. Real GLiREL (`jackboyla/glirel_base`) — genuine zero-shot RE.
-             Uses the GLiNER entities already extracted as `ner` spans, so
-             it gets this domain's fine-grained types for free.
-          2. GLiNER-as-relation-classifier fallback — used only if GLiREL
-             itself can't load in this environment (see `_load_glirel`).
+        Returns a flat list of dicts: {head, relation, tail, score, article_id}.
+        Returns [] if use_glirel=False or if GLiREL cannot load.
 
-        Implementation:
-          • Chunks each article into MAX_WORDS windows.
-          • Runs GLiNER NER on all chunks in one true batched call.
-          • For each article, runs the chosen RE backend per chunk/pair.
-          • Deduplicates via _add_relation() (higher-scoring direction wins).
+        Steps:
+          1. Chunk each article into MAX_WORDS windows.
+          2. Batch-NER all chunks with GLiNER (sub-batches of BATCH_SIZE).
+          3. For each chunk with ≥2 entities, call GLiREL.score_chunk().
+             Fanned across glirel_workers threads (PyTorch releases the GIL
+             during its CPU kernels, so threads really do run in parallel).
+          4. Deduplicate per article via _add_relation() (higher score wins).
         """
         if not self.use_glirel:
             return []
@@ -665,78 +493,51 @@ class EntityExtractor:
         labels = self.get_gliner_labels()
         all_triples: List[Dict] = []
 
-        # Step 1: Build all chunks and their article mapping
-        chunk_to_article = []          # list of (article_id, chunk_text)
-        article_chunks = {a.id: [] for a in articles}
+        # ── Step 1: chunk articles ───────────────────────────────────────────
+        chunk_to_article: List[Tuple[str, str]] = []  # (article_id, chunk_text)
         for article in articles:
             text = (article.content or "").strip()
             if not text:
                 continue
-            chunks = self._chunk_text(text)
-            for chunk in chunks:
-                article_chunks[article.id].append(chunk)
+            for chunk in self._chunk_text(text):
                 chunk_to_article.append((article.id, chunk))
 
         if not chunk_to_article:
             return []
 
-        # Step 2: Batch NER on all chunks (BUG FIX: use _batch_predict, not
-        # predict_entities(list_of_texts, ...) which always raised).
-        # Sub-batched (instead of one call holding every chunk in the run)
-        # so you get progress feedback and a single bad sub-batch doesn't
-        # abort the whole stage.
         chunk_texts = [chunk for _, chunk in chunk_to_article]
+
+        # ── Step 2: batch NER ────────────────────────────────────────────────
         all_ents_raw: List[List[dict]] = []
         n_sub_batches = (len(chunk_texts) + BATCH_SIZE - 1) // BATCH_SIZE
         ner_t0 = time.time()
         for start in _progress(
-            range(0, len(chunk_texts), BATCH_SIZE), total=n_sub_batches, desc="gliner_ner"
+            range(0, len(chunk_texts), BATCH_SIZE),
+            total=n_sub_batches, desc="gliner_ner",
         ):
             sub_batch = chunk_texts[start:start + BATCH_SIZE]
             try:
-                all_ents_raw.extend(_batch_predict(gliner, sub_batch, labels, self.ner_threshold))
+                all_ents_raw.extend(
+                    _batch_predict(gliner, sub_batch, labels, self.ner_threshold)
+                )
             except Exception as e:
                 log.error("gliner_batch_ner_failed", batch_start=start, error=str(e))
                 all_ents_raw.extend([[] for _ in sub_batch])
-        log.info("gliner_ner_complete", chunks=len(chunk_texts), elapsed_s=round(time.time() - ner_t0, 1))
+        log.info(
+            "gliner_ner_complete",
+            chunks=len(chunk_texts),
+            elapsed_s=round(time.time() - ner_t0, 1),
+        )
 
-        # Rebuild mapping: article_id -> list of (chunk_text, entities)
-        article_chunk_ents = {a.id: [] for a in articles}
+        # ── Step 3: build work items (chunks with ≥2 usable entities) ───────
+        article_chunk_ents: Dict[str, List[Tuple[str, List[dict]]]] = {
+            a.id: [] for a in articles
+        }
         for (article_id, chunk_text), ents in zip(chunk_to_article, all_ents_raw):
             if ents:
                 article_chunk_ents[article_id].append((chunk_text, ents))
 
-        # Step 3: Pick a relation-extraction backend once for the whole run.
-        _chunks_with_ents = sum(len(v) for v in article_chunk_ents.values())
-        log.info(
-            "glirel_loading",
-            articles=len(articles),
-            chunks_with_ents=_chunks_with_ents,
-            hint="Loading GLiREL model — ~10-30s on first call, instant from cache after that...",
-        )
-        glirel = self._load_glirel()
-        re_ext = None if glirel is not None else self._load_relation_extractor()
-        backend = "glirel" if glirel is not None else "gliner_fallback"
-        log.info("glirel_backend_selected", backend=backend)
-
-        # ------------------------------------------------------------------
-        # Step 4: Score relations
-        #
-        # THE BUG: this used to call glirel.score_chunk() (one full CPU
-        # transformer forward pass) once per chunk, strictly sequentially,
-        # inside a plain `for article in articles` loop — no batching, no
-        # parallelism, and nothing printed until the whole stage finished.
-        # With hundreds/thousands of chunks and no GPU, that's "hours with
-        # no idea how far along it is."
-        #
-        # THE FIX: flatten article+chunk into one global work list (one
-        # progress bar instead of silence), and fan the GLiREL calls out
-        # across a small thread pool — PyTorch's CPU kernels release the
-        # GIL during the actual forward pass, so concurrent threads really
-        # do use otherwise-idle cores instead of just serializing on Python.
-        # ------------------------------------------------------------------
-
-        work_items: List[Tuple[str, str, List[dict]]] = []  # (article_id, chunk_text, filtered_ents)
+        work_items: List[Tuple[str, str, List[dict]]] = []  # (article_id, chunk, ents)
         for article in articles:
             for chunk_text, ents_raw in article_chunk_ents.get(article.id, []):
                 ents = [
@@ -746,114 +547,92 @@ class EntityExtractor:
                 if len(ents) >= 2:
                     work_items.append((article.id, chunk_text, ents))
 
+        # ── Load GLiREL ──────────────────────────────────────────────────────
         log.info(
-            "glirel_scoring_start",
-            backend=backend,
+            "glirel_loading",
             total_chunks=len(work_items),
-            total_articles=len([a for a in articles if article_chunk_ents.get(a.id)]),
+            hint="Loading GLiREL — ~10-30s first call, instant from cache after...",
         )
-        per_article_relations: Dict[str, Dict[Tuple, float]] = {a.id: {} for a in articles}
-        re_t0 = time.time()
+        glirel = self._load_glirel()
+        if glirel is None:
+            log.error(
+                "glirel_unavailable",
+                hint="Relation extraction skipped — fix GLiREL load error above and rerun.",
+            )
+            return []
 
-        if glirel is not None:
-            # ---- Real GLiREL path, fanned out across worker threads ----
-            n_workers = self.glirel_workers
-            prev_threads = torch.get_num_threads()
-            # Avoid oversubscribing the CPU: split intra-op threads across
-            # the worker threads we're about to launch.
-            torch.set_num_threads(max(1, prev_threads // n_workers))
-            try:
-                if n_workers == 1:
-                    _prev_article_id = None
-                    _article_idx = 0
-                    _article_ids_ordered = list(dict.fromkeys(aid for aid, _, _ in work_items))
-                    _n_articles = len(_article_ids_ordered)
-                    for article_id, chunk_text, ents in _progress(
-                        work_items, total=len(work_items), desc="glirel_score"
-                    ):
-                        if article_id != _prev_article_id:
-                            _article_idx += 1
-                            log.info(
-                                "glirel_article_start",
-                                article=f"{_article_idx}/{_n_articles}",
-                                article_id=article_id,
-                                entities_in_chunk=len(ents),
-                            )
-                            _prev_article_id = article_id
-                        scored = glirel.score_chunk(
-                            chunk_text, ents, RELATION_LABELS, self.glirel_threshold
+        # ── Step 4: score relations ──────────────────────────────────────────
+        per_article_relations: Dict[str, Dict[Tuple, float]] = {
+            a.id: {} for a in articles
+        }
+        n_workers    = self.glirel_workers
+        prev_threads = torch.get_num_threads()
+        torch.set_num_threads(max(1, prev_threads // n_workers))
+        re_t0 = time.time()
+        try:
+            if n_workers == 1:
+                _prev_aid  = None
+                _aid_idx   = 0
+                _aid_order = list(dict.fromkeys(aid for aid, _, _ in work_items))
+                _n_arts    = len(_aid_order)
+                for article_id, chunk_text, ents in _progress(
+                    work_items, total=len(work_items), desc="glirel_score"
+                ):
+                    if article_id != _prev_aid:
+                        _aid_idx += 1
+                        log.info(
+                            "glirel_article_start",
+                            article=f"{_aid_idx}/{_n_arts}",
+                            article_id=article_id,
+                            entities_in_chunk=len(ents),
                         )
+                        _prev_aid = article_id
+                    scored = glirel.score_chunk(
+                        chunk_text, ents, RELATION_LABELS, self.glirel_threshold
+                    )
+                    for item in scored:
+                        _add_relation(
+                            per_article_relations[article_id],
+                            item["head"], item["relation"], item["tail"], item["score"],
+                        )
+            else:
+                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    futures = {
+                        pool.submit(
+                            glirel.score_chunk, chunk_text, ents,
+                            RELATION_LABELS, self.glirel_threshold,
+                        ): article_id
+                        for article_id, chunk_text, ents in work_items
+                    }
+                    for fut in _progress(
+                        as_completed(futures), total=len(futures), desc="glirel_score"
+                    ):
+                        article_id = futures[fut]
+                        try:
+                            scored = fut.result()
+                        except Exception as e:
+                            log.warning(
+                                "glirel_chunk_failed",
+                                article_id=article_id, error=str(e),
+                            )
+                            continue
                         for item in scored:
                             _add_relation(
                                 per_article_relations[article_id],
                                 item["head"], item["relation"], item["tail"], item["score"],
                             )
-                else:
-                    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                        futures = {
-                            pool.submit(
-                                glirel.score_chunk, chunk_text, ents,
-                                RELATION_LABELS, self.glirel_threshold,
-                            ): article_id
-                            for article_id, chunk_text, ents in work_items
-                        }
-                        for fut in _progress(
-                            as_completed(futures), total=len(futures), desc="glirel_score"
-                        ):
-                            article_id = futures[fut]
-                            try:
-                                scored = fut.result()
-                            except Exception as e:
-                                log.warning("glirel_chunk_failed", article_id=article_id, error=str(e))
-                                continue
-                            for item in scored:
-                                _add_relation(
-                                    per_article_relations[article_id],
-                                    item["head"], item["relation"], item["tail"], item["score"],
-                                )
-            finally:
-                torch.set_num_threads(prev_threads)
-        else:
-            # ---- Fallback: GLiNER-as-relation-classifier ----
-            # Flatten pairs across ALL articles into one batch instead of
-            # one score_pairs_batch() call per article — fewer, bigger
-            # batches mean less per-call overhead.
-            flat_pairs = []        # (head_text, tail_text, head_type, tail_type)
-            pair_article_ids = []  # which article each pair came from
-            for article_id, chunk_text, ents in work_items:
-                for head, tail in combinations(ents, 2):
-                    for h, t in [(head, tail), (tail, head)]:
-                        htype = h["label"].lower()
-                        ttype = t["label"].lower()
-                        if any(_passes_constraint(htype, ttype, lbl) for lbl in RELATION_LABELS):
-                            flat_pairs.append((h["text"], t["text"], htype, ttype))
-                            pair_article_ids.append(article_id)
+        finally:
+            torch.set_num_threads(prev_threads)
 
-            if flat_pairs:
-                scored = re_ext.score_pairs_batch(flat_pairs)
-                for article_id, pair_score in _progress(
-                    zip(pair_article_ids, scored), total=len(scored), desc="gliner_re_score"
-                ):
-                    if pair_score is None:
-                        continue
-                    head = pair_score["head_text"].strip()
-                    tail = pair_score["tail_text"].strip()
-                    if not head or not tail or head.lower() == tail.lower():
-                        continue
-                    _add_relation(
-                        per_article_relations[article_id],
-                        head, pair_score["label"], tail, pair_score["score"],
-                    )
-
-        # Convert deduplicated per-article dicts → flat list
+        # ── Convert to flat list ─────────────────────────────────────────────
         for article in articles:
             article_relations = per_article_relations.get(article.id, {})
             for (head, relation, tail), score in article_relations.items():
                 all_triples.append({
-                    "head": head,
-                    "relation": relation,
-                    "tail": tail,
-                    "score": round(score, 4),
+                    "head":       head,
+                    "relation":   relation,
+                    "tail":       tail,
+                    "score":      round(score, 4),
                     "article_id": article.id,
                 })
             if article_relations:
@@ -874,7 +653,7 @@ class EntityExtractor:
 
         log.info(
             "relation_extraction_complete",
-            backend=backend,
+            backend="glirel",
             articles=len(articles),
             chunks_scored=len(work_items),
             triples=len(all_triples),
@@ -883,15 +662,15 @@ class EntityExtractor:
         return all_triples
 
     # ------------------------------------------------------------------
-    # Internal GLiNER NER extraction (unchanged but used for batch)
+    # Internal GLiNER NER
     # ------------------------------------------------------------------
 
     def _extract_gliner_batch(
         self, articles: List[ArticleModel]
     ) -> List[List[EntityMention]]:
-        model = self._load_gliner()
+        model  = self._load_gliner()
         labels = self.get_gliner_labels()
-        results = []
+        results: List[List[EntityMention]] = []
 
         for article in articles:
             text = article.content or ""
@@ -912,41 +691,13 @@ class EntityExtractor:
                 ]
                 results.append(mentions)
             except Exception as e:
-                log.warning(
-                    "gliner_article_failed", article_id=article.id, error=str(e)
-                )
+                log.warning("gliner_article_failed", article_id=article.id, error=str(e))
                 results.append([])
 
         return results
 
-    def _extract_spacy(self, article: ArticleModel) -> List[EntityMention]:
-        nlp = self._load_spacy()
-        doc = nlp(article.content or "")
-        type_map = {
-            "PERSON":     "person",
-            "ORG":        "organization",
-            "GPE":        "country",
-            "LOC":        "location",
-            "EVENT":      "event",
-            "PRODUCT":    "product",
-            "WORK_OF_ART":"product",
-            "LAW":        "law or sanction",
-            "NORP":       "political group",
-        }
-        return [
-            EntityMention(
-                text=ent.text,
-                entity_type=type_map.get(ent.label_, "Unknown"),
-                confidence=0.7,
-                article_id=article.id,
-                span_start=ent.start_char,
-                span_end=ent.end_char,
-            )
-            for ent in doc.ents
-        ]
-
     # ------------------------------------------------------------------
-    # Chunking helper
+    # Text chunker
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -958,7 +709,7 @@ class EntityExtractor:
             if ln.strip() and not HEADER_RE.match(ln.strip())
         ]
         chunks: List[str] = []
-        cur: List[str] = []
+        cur: List[str]    = []
         n = 0
 
         def flush():
@@ -969,15 +720,9 @@ class EntityExtractor:
 
         for p in paras:
             words = p.split()
-            w = len(words)
+            w     = len(words)
 
             if w > max_words:
-                # BUG FIX: a paragraph longer than max_words used to be
-                # appended whole regardless of size (the old `n + w >
-                # max_words and cur` check is False when `cur` is empty),
-                # producing oversized chunks that GLiNER/GLiREL silently
-                # truncate downstream — losing entities/relations past
-                # the cutoff. Split it into max_words-sized pieces instead.
                 flush()
                 for i in range(0, w, max_words):
                     chunks.append(" ".join(words[i:i + max_words]))

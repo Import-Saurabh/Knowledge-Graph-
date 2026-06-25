@@ -1,60 +1,45 @@
-""" src/relations/relation_ontology.py
+"""
+src/relations/relation_ontology.py
 
-Normalises free-text relation phrases to canonical forms.
+Normalises GLiREL relation phrases to canonical labels.
 
-Redesign — dynamic real-world relation detection
-=================================================
-Previous version was fully static: a 31-label alias dict acted as a rigid
-gate, so any phrase not in the dict was substring-matched (producing false
-positives like "captured" → MILITARY_OCCUPATION for "captured on camera")
-and novel relation types were silently collapsed to RELATED_TO.
+No Wikidata. No LLM. Pure local semantic normalization.
 
-New three-stage pipeline
-------------------------
+Three-stage pipeline
+--------------------
 Stage 1 — Direct canonical check
-    If the incoming text is already a known canonical label (the LLM in
-    relation_extractor.py is instructed to return one), accept it directly.
-    No substring matching.
+    If the raw GLiREL phrase is already a known UPPER_SNAKE canonical, accept it.
 
-Stage 2 — Vocab centroid cosine similarity  (lazy, auto-initialised)
+Stage 2 — Vocab centroid cosine similarity (lazy, auto-initialised)
     Each canonical label is embedded as the centroid of
-    [canonical_name] + [all alias phrases].  Input phrase is compared to
-    all centroids; if cos ≥ VOCAB_SIM_THRESHOLD it maps to that canonical.
+    [canonical_name] + [alias phrases]. Input phrase is compared to all
+    centroids; if cos ≥ VOCAB_SIM_THRESHOLD it maps to that canonical.
 
 Stage 3 — ChromaDB emergent-cluster nearest-neighbour
     The running ChromaDB collection contains every relation seen so far.
     If a phrase matches an existing stored relation at cos ≥ EMERGENT_SIM_THRESHOLD
-    it joins that cluster (reuses its canonical label).
+    it joins that cluster and reuses its canonical.
 
 Stage 4 — New emergent canonical
-    No match found → create a new canonical from the raw phrase.
+    No match → derive a new canonical from the raw phrase:
     e.g. "imposed travel ban on" → "IMPOSED_TRAVEL_BAN_ON".
-    This canonical grows its own cluster in ChromaDB and becomes a
-    first-class citizen alongside the seed vocabulary.
+    Stored in SQLite + ChromaDB and becomes a first-class citizen.
 
-get_relation_taxonomy()
-    Queries SQLite, groups rows by canonical, returns live taxonomy
-    sorted by usage — reflecting what actually appeared in the data.
-
-cluster_relations()
-    Groups all SQLite rows by canonical label → returns a dict.
-
-Wikidata
-    Rate-limited to 1 req / 65 s (Wikidata WDQS policy).
-    Skipped entirely when the last call was too recent.
-    Fully optional — disable with wikidata_enabled=False at init.
+Public helpers
+--------------
+get_relation_taxonomy()   — live taxonomy sorted by usage from SQLite
+cluster_relations()       — {canonical: [raw_phrases]} dict
+get_canonical_labels()    — seed labels + any emergent labels in DB
 """
 
 import re
-import time
-import uuid
 import threading
+import uuid
 import numpy as np
 from collections import defaultdict
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 
-from SPARQLWrapper import SPARQLWrapper, JSON
 from src.utils.db import get_session, RelationOntologyDB
 from src.utils.logger import get_logger
 from src.utils.config import settings
@@ -64,15 +49,14 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Thresholds
 # ---------------------------------------------------------------------------
-VOCAB_SIM_THRESHOLD    = 0.72   # centroid cosine → map to spine canonical
-EMERGENT_SIM_THRESHOLD = 0.82   # ChromaDB cosine → join existing cluster
-WIKIDATA_MIN_INTERVAL  = 65.0   # seconds between SPARQL calls (WDQS policy)
+VOCAB_SIM_THRESHOLD    = 0.72   # centroid cosine → map to seed canonical
+EMERGENT_SIM_THRESHOLD = 0.82   # ChromaDB cosine → join existing emergent cluster
 
 # ---------------------------------------------------------------------------
-# Seed vocabulary  (spine — not a cage)
-# Each canonical maps to representative alias phrases used to compute the
-# centroid embedding.  Do NOT use for substring matching.
+# Seed vocabulary
 # ---------------------------------------------------------------------------
+# Each canonical maps to representative alias phrases used to compute the
+# centroid embedding used for Stage 2.  Not used for substring matching.
 CONTROLLED_VOCABULARY: Dict[str, List[str]] = {
     "MILITARY_ATTACK": [
         "launched airstrike against", "bombed", "shelled", "struck",
@@ -200,79 +184,46 @@ CONTROLLED_VOCABULARY: Dict[str, List[str]] = {
     ],
 }
 
-# Fast set for direct-canonical check (Stage 1) and for checking seed labels
+# Fast set for Stage 1 direct-canonical check
 SEED_SET: set = set(CONTROLLED_VOCABULARY.keys())
-
-
-# ---------------------------------------------------------------------------
-# Wikidata SPARQL rate limiter
-# ---------------------------------------------------------------------------
-class _WikidataRateLimiter:
-    """Enforces Wikidata WDQS policy: max 1 req / 65 s."""
-
-    def __init__(self, min_interval: float = WIKIDATA_MIN_INTERVAL):
-        self._lock         = threading.Lock()
-        self._last_call    = 0.0
-        self.min_interval  = min_interval
-
-    def try_acquire(self) -> bool:
-        """Return True if a call may proceed now; False if still cooling down."""
-        with self._lock:
-            now  = time.monotonic()
-            wait = self.min_interval - (now - self._last_call)
-            if wait > 0:
-                return False
-            self._last_call = now
-            return True
-
-
-_WIKIDATA_RL = _WikidataRateLimiter()
 
 
 # ---------------------------------------------------------------------------
 # Manager
 # ---------------------------------------------------------------------------
+
 class RelationOntologyManager:
     """
-    Normalises relation phrases to canonical labels and builds a live taxonomy.
+    Normalises GLiREL relation phrases to canonical labels and tracks a live
+    taxonomy in SQLite + ChromaDB.
 
     Parameters
     ----------
-    chroma_manager       : ChromaManager instance
-    embedding_generator  : EmbeddingGenerator instance
-    wikidata_enabled     : set False to disable all SPARQL calls (useful when
-                           Wikidata is rate-limiting or not needed)
+    chroma_manager      : ChromaManager instance (for Stage 3 cluster lookup)
+    embedding_generator : EmbeddingGenerator instance (BGE embeddings)
     """
 
     def __init__(
         self,
         chroma_manager,
         embedding_generator,
-        wikidata_enabled: bool = True,
     ):
-        self.chroma           = chroma_manager
-        self.embedder         = embedding_generator
-        self.wikidata_enabled = wikidata_enabled
+        self.chroma   = chroma_manager
+        self.embedder = embedding_generator
 
-        # canonical → normalised centroid vector (lazy-populated)
+        # canonical → normalised centroid vector (lazy-populated on first use)
         self._vocab_embeddings: Dict[str, np.ndarray] = {}
         self._vocab_lock = threading.Lock()
 
-        # Wikidata
-        self._wikidata_property_cache: Dict[str, Optional[str]] = {}
-        self._sparql = SPARQLWrapper("https://query.wikidata.org/sparql")
-        self._sparql.setReturnFormat(JSON)
-        self._sparql.setTimeout(10)
-
     # ------------------------------------------------------------------
-    # Public: vocab embeddings
+    # Vocab embedding helpers
     # ------------------------------------------------------------------
 
     def precompute_vocab_embeddings(self) -> None:
         """
         Embed each canonical as the centroid of its label + alias phrases.
-        Called explicitly when Wikidata relation-normalization is enabled;
-        otherwise triggered lazily on first similarity lookup.
+        Call this explicitly at pipeline startup to avoid a latency spike on
+        the first normalize_relation() call during a run.
         """
         with self._vocab_lock:
             for canonical, aliases in CONTROLLED_VOCABULARY.items():
@@ -295,17 +246,11 @@ class RelationOntologyManager:
         log.info("vocab_embeddings_ready", count=len(self._vocab_embeddings))
 
     def _ensure_vocab_embeddings(self) -> None:
-        """Lazy init — called before any similarity check."""
         if not self._vocab_embeddings:
             self.precompute_vocab_embeddings()
 
-    # ------------------------------------------------------------------
-    # Public: seed label check
-    # ------------------------------------------------------------------
-
     @staticmethod
     def is_seed_canonical(canonical: str) -> bool:
-        """Return True if the given canonical label is in the seed vocabulary."""
         return canonical in SEED_SET
 
     # ------------------------------------------------------------------
@@ -314,24 +259,25 @@ class RelationOntologyManager:
 
     def normalize_relation(self, relation_text: str) -> str:
         """
-        Three-stage normalisation:
-          1. Direct canonical label check
-          2. Vocab centroid cosine similarity
-          3. ChromaDB emergent-cluster nearest-neighbour
-          4. Emergent canonical (new type)
+        Normalise a raw GLiREL relation phrase to a canonical label.
+
+        Stage 1 — direct canonical check (O(1) set lookup)
+        Stage 2 — vocab centroid cosine similarity
+        Stage 3 — ChromaDB emergent nearest-neighbour
+        Stage 4 — new emergent canonical derived from the phrase
         """
         if not relation_text or not relation_text.strip():
             return "RELATED_TO"
 
-        # ── Stage 1: direct canonical check ───────────────────────────
+        # ── Stage 1: direct canonical ──────────────────────────────────────
         upper = relation_text.strip().upper()
         if upper in SEED_SET:
             log.debug("relation_normalized_direct", raw=relation_text, canonical=upper)
             return upper
 
-        # ── Embed input ────────────────────────────────────────────────
+        # ── Embed ──────────────────────────────────────────────────────────
         cleaned      = self._preprocess(relation_text)
-        embedding_l: Optional[list]      = None
+        embedding_l: Optional[list]        = None
         embedding_np: Optional[np.ndarray] = None
         try:
             embedding_l  = self.embedder.embed_text(cleaned)
@@ -339,114 +285,54 @@ class RelationOntologyManager:
         except Exception as e:
             log.warning("relation_embedding_failed", text=cleaned, error=str(e))
 
-        # ── Stage 2: vocab centroid cosine ─────────────────────────────
+        # ── Stage 2: vocab centroid cosine ────────────────────────────────
         if embedding_np is not None:
             self._ensure_vocab_embeddings()
             vocab_canonical, vocab_sim = self._vocab_cosine_match(embedding_np)
             if vocab_canonical and vocab_sim >= VOCAB_SIM_THRESHOLD:
-                log.debug("relation_normalized_vocab",
-                          raw=relation_text, canonical=vocab_canonical,
-                          sim=round(vocab_sim, 3))
+                log.debug(
+                    "relation_normalized_vocab",
+                    raw=relation_text, canonical=vocab_canonical,
+                    sim=round(vocab_sim, 3),
+                )
                 return self._persist_relation(
-                    cleaned, embedding_l, relation_text,
-                    canonical=vocab_canonical,
+                    cleaned, embedding_l, relation_text, canonical=vocab_canonical
                 )
 
-        # ── Stage 3: ChromaDB emergent nearest-neighbour ───────────────
+        # ── Stage 3: ChromaDB emergent nearest-neighbour ──────────────────
         if embedding_l is not None and self.chroma:
             emergent_canonical, emergent_sim = self._chroma_cluster_match(embedding_l)
             if emergent_canonical and emergent_sim >= EMERGENT_SIM_THRESHOLD:
-                log.debug("relation_normalized_emergent",
-                          raw=relation_text, canonical=emergent_canonical,
-                          sim=round(emergent_sim, 3))
+                log.debug(
+                    "relation_normalized_emergent",
+                    raw=relation_text, canonical=emergent_canonical,
+                    sim=round(emergent_sim, 3),
+                )
                 return self._persist_relation(
-                    cleaned, embedding_l, relation_text,
-                    canonical=emergent_canonical,
+                    cleaned, embedding_l, relation_text, canonical=emergent_canonical
                 )
 
-        # ── Stage 4: new emergent canonical ───────────────────────────
+        # ── Stage 4: new emergent canonical ──────────────────────────────
         emergent = self._make_emergent_canonical(cleaned)
         log.info("new_emergent_relation", raw=relation_text, canonical=emergent)
         return self._persist_relation(
             cleaned, embedding_l, relation_text, canonical=emergent
         )
 
-    def normalize_relation_with_wikidata(
-        self, relation_text: str
-    ) -> Tuple[str, Optional[str]]:
-        canonical = self.normalize_relation(relation_text)
-        prop = self.get_wikidata_property(relation_text) if self.wikidata_enabled else None
-        if prop:
-            log.debug("wikidata_property_mapped",
-                      relation=relation_text, prop=prop, canonical=canonical)
-        return canonical, prop
-
-    def get_wikidata_property(self, relation_text: str) -> Optional[str]:
-        """
-        Look up the closest Wikidata property for a relation phrase.
-        Hard-limited to 1 request per 65 seconds (WDQS policy).
-        Returns None immediately if the rate limiter blocks.
-        """
-        if not self.wikidata_enabled:
-            return None
-
-        phrase = relation_text.lower().strip()
-        if phrase in self._wikidata_property_cache:
-            return self._wikidata_property_cache[phrase]
-
-        if not _WIKIDATA_RL.try_acquire():
-            log.debug("wikidata_rate_limit_skipped", phrase=phrase)
-            return None
-
-        # Sanitise phrase for SPARQL string injection
-        safe_phrase = re.sub(r'["\\\n]', " ", phrase)[:60]
-
-        query = f"""
-        SELECT ?property ?propertyLabel WHERE {{
-          ?property a wikibase:Property .
-          ?property rdfs:label ?propertyLabel .
-          FILTER(LANG(?propertyLabel) = "en")
-          FILTER(CONTAINS(LCASE(?propertyLabel), "{safe_phrase}"))
-        }}
-        LIMIT 3
-        """
-        try:
-            self._sparql.setQuery(query)
-            results  = self._sparql.query().convert()
-            bindings = results["results"]["bindings"]
-            if bindings:
-                prop = bindings[0]["property"]["value"].split("/")[-1]
-                self._wikidata_property_cache[phrase] = prop
-                return prop
-        except Exception as e:
-            log.warning("wikidata_property_query_failed", phrase=phrase, error=str(e))
-
-        self._wikidata_property_cache[phrase] = None
-        return None
-
     # ------------------------------------------------------------------
-    # Public: taxonomy & metadata
+    # Public: taxonomy helpers
     # ------------------------------------------------------------------
 
     def get_relation_taxonomy(self) -> List[dict]:
         """
         Return a live taxonomy built from what actually appeared in the data.
-
-        Each entry:
-        {
-            "canonical":    str,          # canonical label
-            "is_in_vocab":  bool,         # True if in seed vocabulary
-            "usage_count":  int,          # total occurrences
-            "phrase_count": int,          # unique raw phrases seen
-            "phrases":      List[str],    # raw phrases mapped here (top 10)
-            "first_seen":   str | None,
-            "last_seen":    str | None,
-        }
+        Each entry: {canonical, is_in_vocab, usage_count, phrase_count,
+                     phrases (top 10), first_seen, last_seen}
         Sorted by usage_count descending.
         """
         try:
-            session  = get_session()
-            db_rows  = session.query(RelationOntologyDB).all()
+            session = get_session()
+            db_rows = session.query(RelationOntologyDB).all()
             session.close()
         except Exception as e:
             log.warning("get_relation_taxonomy_db_error", error=str(e))
@@ -470,7 +356,6 @@ class RelationOntologyManager:
             g["phrase_count"] += 1
             if row.relation_text:
                 g["phrases"].append(row.relation_text)
-            # track time range
             if row.first_seen:
                 ts = row.first_seen.isoformat()
                 if g["first_seen"] is None or ts < g["first_seen"]:
@@ -480,21 +365,13 @@ class RelationOntologyManager:
                 if g["last_seen"] is None or ts > g["last_seen"]:
                     g["last_seen"] = ts
 
-        # Trim phrases list to top 10 by keeping most recently seen
         for g in groups.values():
             g["phrases"] = g["phrases"][:10]
 
-        taxonomy = sorted(groups.values(), key=lambda x: x["usage_count"], reverse=True)
-        log.info("taxonomy_built",
-                 total_canonicals=len(taxonomy),
-                 emergent=sum(1 for t in taxonomy if not t["is_in_vocab"]))
-        return taxonomy
+        return sorted(groups.values(), key=lambda x: x["usage_count"], reverse=True)
 
     def cluster_relations(self) -> Dict[str, List[str]]:
-        """
-        Group all stored relation phrases by their canonical label.
-        Returns { canonical: [raw_phrase, ...] }
-        """
+        """Return {canonical: [raw_phrase, ...]} from SQLite."""
         try:
             session = get_session()
             rows    = session.query(RelationOntologyDB).all()
@@ -534,13 +411,11 @@ class RelationOntologyManager:
 
     def _preprocess(self, text: str) -> str:
         t = text.lower().strip()
-        t = re.sub(r"\s+", " ", t)
-        return t
+        return re.sub(r"\s+", " ", t)
 
     def _vocab_cosine_match(
         self, embedding_np: np.ndarray
     ) -> Tuple[Optional[str], float]:
-        """Compare query embedding to all vocab centroids."""
         if not self._vocab_embeddings:
             return None, 0.0
         query = embedding_np / (np.linalg.norm(embedding_np) + 1e-9)
@@ -554,7 +429,6 @@ class RelationOntologyManager:
     def _chroma_cluster_match(
         self, embedding_l: list
     ) -> Tuple[Optional[str], float]:
-        """Search ChromaDB for nearest stored relation."""
         try:
             matches = self.chroma.search_relation_ontology(embedding_l, n_results=3)
             if not (matches and matches.get("ids") and matches["ids"][0]):
@@ -563,11 +437,10 @@ class RelationOntologyManager:
             distances = matches.get("distances", [[]])[0]
             if not ids or not distances:
                 return None, 0.0
-            # ChromaDB returns L2 distance; convert to cosine similarity proxy
+            # ChromaDB returns L2 distance; convert to cosine-similarity proxy
             similarity = 1.0 - min(float(distances[0]), 1.0)
             if similarity < EMERGENT_SIM_THRESHOLD:
                 return None, similarity
-            # Fetch canonical from DB
             session   = get_session()
             rel       = session.query(RelationOntologyDB).filter_by(
                 relation_id=ids[0]
@@ -584,20 +457,20 @@ class RelationOntologyManager:
     @staticmethod
     def _make_emergent_canonical(cleaned: str) -> str:
         """
-        Convert a preprocessed phrase to a canonical-style label.
+        Convert a preprocessed phrase to UPPER_SNAKE canonical.
         e.g. "imposed travel ban on" → "IMPOSED_TRAVEL_BAN_ON"
-        Strips stopwords and normalises to UPPER_SNAKE_CASE.
         """
-        stopwords = {"the", "a", "an", "to", "of", "for", "with", "by", "on",
-                     "in", "at", "and", "or", "is", "was", "were", "been"}
+        stopwords = {
+            "the", "a", "an", "to", "of", "for", "with", "by", "on",
+            "in", "at", "and", "or", "is", "was", "were", "been",
+        }
         tokens = [
             t for t in re.sub(r"[^a-z0-9 ]", "", cleaned.lower()).split()
             if t not in stopwords
         ]
         if not tokens:
             return "RELATED_TO"
-        label = "_".join(tokens[:6]).upper()   # cap at 6 tokens
-        # Don't duplicate seed vocab labels
+        label = "_".join(tokens[:6]).upper()
         if label in SEED_SET:
             label = label + "_EMERGENT"
         return label
@@ -613,10 +486,7 @@ class RelationOntologyManager:
         original_text: str,
         canonical: str,
     ) -> str:
-        """
-        Upsert a relation row in SQLite and ChromaDB.
-        If the original_text already exists → increment usage and return.
-        """
+        """Upsert relation in SQLite and ChromaDB; return canonical."""
         session = get_session()
         try:
             existing = session.query(RelationOntologyDB).filter_by(
@@ -632,7 +502,6 @@ class RelationOntologyManager:
         finally:
             session.close()
 
-        # New row
         relation_id = str(uuid.uuid4())
         emb_bytes   = (
             np.array(embedding_l, dtype=np.float32).tobytes()
@@ -658,7 +527,6 @@ class RelationOntologyManager:
         finally:
             session.close()
 
-        # Add to ChromaDB
         if embedding_l is not None and self.chroma:
             try:
                 self.chroma.add_relations(
